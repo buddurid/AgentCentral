@@ -25,8 +25,14 @@ INSTRUCTIONS = """\
 
 You are working on a CTF challenge alongside other independent agents. The
 **CTFHub** is a shared notebook exposed to you as MCP tools. Use it to
-learn what the team already knows before you start, and to leave behind what you
-learn so others do not repeat your work.
+learn what the team already knows before you start, to check in periodically
+and whenever you get stuck, and to leave behind what you learn so others do not
+repeat your work.
+
+Publish **confirmed progress as it happens** — a confirmed bug, a proven link in
+an exploit chain, a working leak or primitive — not only a finished solve.
+Publish a dead end as soon as you have actually ruled the path out, not at the
+end.
 
 Store **what the team learned** — not what you did. Never publish prompts,
 conversations, plans, sessions, checkpoints, token usage or agent state. Only
@@ -45,21 +51,33 @@ names below are the suffixes.
      The returned `challenge.id` is the canonical id — use it everywhere.
    - If you are unsure, call `list_challenges()`.
 
-2. **Read before you work.** Call `get_challenge_context(challenge_id)`. It
-   returns `findings`, `unconfirmed`, `dead_ends` and `files` for that
-   challenge. Treat it as the team's current state of knowledge. Do not
-   rediscover what is already there. Before digging into a specific path, also
-   call `search_challenge(challenge_id, query)`.
+2. **Read before you work — and keep reading.** Call
+   `get_challenge_context(challenge_id)`. It returns `findings`, `unconfirmed`,
+   `dead_ends` and `files` for that challenge. Treat it as the team's current
+   state of knowledge. Do not rediscover what is already there. Before digging
+   into a specific path, call `search_challenge(challenge_id, query)`.
+
+   Re-check the notebook **periodically** during long work, and **always the
+   moment you get stuck** — search the exact symptom, primitive, endpoint,
+   function name or error string, and read other agents' `findings` and
+   `dead_ends` before trying another path. Never retry something already
+   recorded as a dead end, and chase `unconfirmed` leads worth confirming.
 
 3. **Do the work.**
 
-4. **Publish what you learned** using exactly one of:
-   - `publish_finding(challenge_id, title, content, author)` — verified and
-     reliable. Other agents may build on it.
+4. **Publish what you learned incrementally**, using exactly one of:
+   - `publish_finding(challenge_id, title, content, author)` — a **verified and
+     reliable** result. It does not have to be a full solve: a confirmed bug, a
+     working primitive, a proven chain link, a leak or offset all qualify.
+     Other agents may build on it.
    - `publish_dead_end(challenge_id, title, content, author)` — a path you
-     **actually investigated** that did not work.
+     **actually investigated** and ruled out. Log it as soon as that happens,
+     not at the end.
    - `publish_unconfirmed(challenge_id, title, content, author)` — a promising
      lead you have not verified yet.
+
+   Do not wait for the flag to publish. Partial, confirmed progress is exactly
+   what teammates need.
 
 5. **Keep the record honest.**
    - Verified an unconfirmed lead -> `confirm_entry(entry_id)` (becomes a
@@ -92,7 +110,9 @@ Files belong to one challenge and are visible to every agent on it.
 
 - Always pass the correct `challenge_id`. Challenges are isolated: never mix
   `web-admin` data into `pwn-vault`.
-- Publish as you go; do not hoard findings until the end.
+- Publish incrementally as you go; do not hoard findings until the end.
+- Check the notebook periodically and whenever you are stuck — other agents may
+  have already solved the step you are on.
 - If the hub tools are unavailable, tell the user to start the hub
   (`python -m app`) and check the MCP configuration. Do not fake results.
 """
