@@ -1,7 +1,7 @@
 """Thin MCP interface over the CTFHub REST API.
 
 Run with:  python -m mcp_server
-Configure the hub location with HUB_URL in the project .env
+Configure the hub location with the HUB_URL environment variable
 (default http://localhost:8000).
 """
 

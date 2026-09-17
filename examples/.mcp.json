@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ctfhub": {
+      "command": "python",
+      "args": ["-m", "mcp_server"],
+      "env": {
+        "HUB_URL": "http://localhost:8000",
+        "PYTHONPATH": "/home/buddurid/tools/shared-multi-agents-context"
+      }
+    }
+  }
+}

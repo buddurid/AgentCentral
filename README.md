@@ -69,7 +69,6 @@ the MCP code only talks to the server over HTTP.
 | `app/__main__.py`          | Server entry point (`python -m app`) running uvicorn                   |
 | `mcp_server/server.py`     | MCP tools; each one calls the REST API over HTTP                       |
 | `mcp_server/__main__.py`   | MCP entry point (`python -m mcp_server`)                               |
-| `config.py`                | Loads `.env` for both packages                                         |
 | `static/index.html`        | Single-file vanilla-JS UI served at `/`                               |
 | `tests/test_api.py`      | REST tests using FastAPI's `TestClient`                               |
 
@@ -134,21 +133,15 @@ to `HUB_URL` (default `http://localhost:8000`). That means:
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env     # then edit HUB_URL if needed (optional, has defaults)
 python -m app
 ```
 
 Open <http://localhost:8000> for the UI, <http://localhost:8000/docs> for Swagger.
 
-### Configuration (`.env`)
+### Configuration
 
-Settings are read from a `.env` file in the project root; real environment
-variables take precedence over it. See `.env.example` for the template.
-
-```bash
-# .env
-HUB_URL=http://localhost:8000
-```
+There is no config file — settings come from environment variables (defaults
+work out of the box):
 
 | Variable         | Default          | Meaning                              |
 | ---------------- | ---------------- | ------------------------------------ |
@@ -157,8 +150,9 @@ HUB_URL=http://localhost:8000
 | `HUB_PORT`       | `8000`           | Hub server port                      |
 | `HUB_DATA_DIR`   | `./data`         | SQLite + file storage                |
 
-Point every agent's `.env` (or their harness MCP `env` block) at the same
-`HUB_URL` so they share one hub.
+The MCP server reads `HUB_URL` from its environment; the example harness
+configs below set it for you. To share one hub between machines, point every
+agent's `HUB_URL` at the hub's address.
 
 Run the tests:
 
@@ -320,8 +314,12 @@ It only creates when nothing similar exists (`{"created": true, ...}`).
 
 ### Config snippets
 
-Throughout, replace `/ABS/PATH/TO/HUB` with the absolute path to this repo and
-use the Python that has the requirements installed (the repo venv is shown).
+Ready-to-use examples live in `examples/`: `examples/opencode.json` (opencode)
+and `examples/.mcp.json` (Claude Code). Copy the relevant one to your project
+root — Claude Code requires the filename `.mcp.json`. The snippets below show
+the shape; replace `/ABS/PATH/TO/HUB` with the absolute path to this repo.
+`python` is whatever interpreter has `requirements.txt` installed (a venv works
+too, just point the command at its `bin/python`).
 
 #### opencode
 
@@ -334,7 +332,7 @@ use the Python that has the requirements installed (the repo venv is shown).
     "ctfhub": {
       "type": "local",
       "command": [
-        "/ABS/PATH/TO/HUB/.venv/bin/python",
+        "python",
         "-m",
         "mcp_server"
       ],
@@ -358,7 +356,7 @@ Restart opencode; tools appear as `ctfhub_get_challenge_context`, etc.
 claude mcp add ctfhub --scope user \
   --env HUB_URL=http://localhost:8000 \
   --env PYTHONPATH=/ABS/PATH/TO/HUB \
-  -- /ABS/PATH/TO/HUB/.venv/bin/python -m mcp_server
+  -- python -m mcp_server
 ```
 
 Equivalent `.mcp.json`:
@@ -367,7 +365,7 @@ Equivalent `.mcp.json`:
 {
   "mcpServers": {
     "ctfhub": {
-      "command": "/ABS/PATH/TO/HUB/.venv/bin/python",
+      "command": "python",
       "args": ["-m", "mcp_server"],
       "env": {
         "HUB_URL": "http://localhost:8000",
@@ -386,7 +384,7 @@ Tools are named `mcp__ctfhub__get_challenge_context`, etc. Verify with `/mcp`.
 
 ```toml
 [mcp_servers.ctfhub]
-command = "/ABS/PATH/TO/HUB/.venv/bin/python"
+command = "python"
 args = ["-m", "mcp_server"]
 cwd = "/ABS/PATH/TO/HUB"
 env = { HUB_URL = "http://localhost:8000" }
@@ -398,16 +396,10 @@ Or with the CLI:
 codex mcp add ctfhub \
   --env HUB_URL=http://localhost:8000 \
   --env PYTHONPATH=/ABS/PATH/TO/HUB \
-  -- /ABS/PATH/TO/HUB/.venv/bin/python -m mcp_server
+  -- python -m mcp_server
 ```
 
 Check with `codex mcp list`, or type `/mcp` inside the Codex TUI.
-
-#### Bare `python` (no venv)
-
-If you installed the requirements globally, replace the interpreter with your
-`python3` path — the `PYTHONPATH`/`cwd` setting still matters so
-`-m mcp_server` resolves.
 
 ---
 
@@ -445,18 +437,19 @@ can copy the same text into their own `AGENTS.md` / `CLAUDE.md`.
 ```
 .
 ├── app/                  # FastAPI server
-│   ├── __init__.py       # imports config (loads .env)
+│   ├── __init__.py
 │   ├── __main__.py       # python -m app
 │   ├── db.py             # engine, models, init_db / migration
 │   └── main.py           # FastAPI app (REST + UI route)
 ├── mcp_server/           # MCP client / tools
-│   ├── __init__.py       # imports config (loads .env)
+│   ├── __init__.py
 │   ├── __main__.py       # python -m mcp_server
 │   └── server.py         # MCP tools -> REST API
-├── config.py             # shared .env loader
 ├── static/index.html     # web UI
 ├── tests/test_api.py
-├── .env.example          # copy to .env
+├── examples/             # example harness configs
+│   ├── opencode.json
+│   └── .mcp.json
 ├── requirements.txt
 ├── pytest.ini
 └── README.md

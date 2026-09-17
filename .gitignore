@@ -2,7 +2,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 data/
-.env
 .venv/
 venv/
 challenge_testing*/

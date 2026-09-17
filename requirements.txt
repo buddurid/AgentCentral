@@ -2,7 +2,6 @@ fastapi
 uvicorn[standard]
 sqlalchemy
 python-multipart
-python-dotenv
 httpx
 mcp>=2
 pytest
