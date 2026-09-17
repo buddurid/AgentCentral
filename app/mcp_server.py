@@ -1,4 +1,4 @@
-"""Thin MCP interface over the CTF Knowledge Hub REST API.
+"""Thin MCP interface over the CTFHub REST API.
 
 Run with:  python -m app.mcp_server
 Configure the hub location with HUB_URL (default http://localhost:8000).
@@ -20,10 +20,10 @@ CLIENT_HOST = socket.gethostname()
 # server instructions inject this into the model alongside the tools, so agents
 # learn the hub workflow without any per-harness configuration.
 INSTRUCTIONS = """\
-# CTF Knowledge Hub — agent instructions
+# CTFHub — agent instructions
 
 You are working on a CTF challenge alongside other independent agents. The
-**CTF Knowledge Hub** is a shared notebook exposed to you as MCP tools. Use it to
+**CTFHub** is a shared notebook exposed to you as MCP tools. Use it to
 learn what the team already knows before you start, and to leave behind what you
 learn so others do not repeat your work.
 
@@ -32,7 +32,7 @@ conversations, plans, sessions, checkpoints, token usage or agent state. Only
 research knowledge.
 
 Tool names may be prefixed by your harness (for example
-`ctf-hub_get_challenge_context` or `mcp__ctf-hub__get_challenge_context`); the
+`ctfhub_get_challenge_context` or `mcp__ctfhub__get_challenge_context`); the
 names below are the suffixes.
 
 ## Every session
@@ -96,7 +96,7 @@ Files belong to one challenge and are visible to every agent on it.
   (`python -m app`) and check the MCP configuration. Do not fake results.
 """
 
-mcp = MCPServer("ctf-knowledge-hub", instructions=INSTRUCTIONS)
+mcp = MCPServer("ctfhub", instructions=INSTRUCTIONS)
 
 
 async def _request(method: str, path: str, **kwargs):

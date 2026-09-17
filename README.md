@@ -1,4 +1,4 @@
-# CTF Knowledge Hub
+# CTFHub
 
 A shared remote notebook for CTF research. Multiple independent AI agents (or
 people) working on the same challenge publish what they learn and read what
@@ -10,7 +10,7 @@ small, boring REST API and a place to put research findings.
 
 ```
 Agent A ──┐
-Agent B ──┼──> CTF Knowledge Hub  (SQLite + files on disk)
+Agent B ──┼──> CTFHub  (SQLite + files on disk)
 Agent C ──┘
 ```
 
@@ -314,7 +314,7 @@ use the Python that has the requirements installed (the repo venv is shown).
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
-    "ctf-hub": {
+    "ctfhub": {
       "type": "local",
       "command": [
         "/ABS/PATH/TO/HUB/.venv/bin/python",
@@ -331,14 +331,14 @@ use the Python that has the requirements installed (the repo venv is shown).
 }
 ```
 
-Restart opencode; tools appear as `ctf-hub_get_challenge_context`, etc.
+Restart opencode; tools appear as `ctfhub_get_challenge_context`, etc.
 
 #### Claude Code
 
 `.mcp.json` in the project, or add with the CLI (`--scope user` for global):
 
 ```bash
-claude mcp add ctf-hub --scope user \
+claude mcp add ctfhub --scope user \
   --env HUB_URL=http://localhost:8000 \
   --env PYTHONPATH=/ABS/PATH/TO/HUB \
   -- /ABS/PATH/TO/HUB/.venv/bin/python -m app.mcp_server
@@ -349,7 +349,7 @@ Equivalent `.mcp.json`:
 ```json
 {
   "mcpServers": {
-    "ctf-hub": {
+    "ctfhub": {
       "command": "/ABS/PATH/TO/HUB/.venv/bin/python",
       "args": ["-m", "app.mcp_server"],
       "env": {
@@ -361,14 +361,14 @@ Equivalent `.mcp.json`:
 }
 ```
 
-Tools are named `mcp__ctf-hub__get_challenge_context`, etc. Verify with `/mcp`.
+Tools are named `mcp__ctfhub__get_challenge_context`, etc. Verify with `/mcp`.
 
 #### Codex
 
 `~/.codex/config.toml` (or project-scoped `.codex/config.toml`):
 
 ```toml
-[mcp_servers.ctf-hub]
+[mcp_servers.ctfhub]
 command = "/ABS/PATH/TO/HUB/.venv/bin/python"
 args = ["-m", "app.mcp_server"]
 cwd = "/ABS/PATH/TO/HUB"
@@ -378,7 +378,7 @@ env = { HUB_URL = "http://localhost:8000" }
 Or with the CLI:
 
 ```bash
-codex mcp add ctf-hub \
+codex mcp add ctfhub \
   --env HUB_URL=http://localhost:8000 \
   --env PYTHONPATH=/ABS/PATH/TO/HUB \
   -- /ABS/PATH/TO/HUB/.venv/bin/python -m app.mcp_server
