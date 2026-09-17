@@ -1,7 +1,8 @@
 """Thin MCP interface over the CTFHub REST API.
 
-Run with:  python -m app.mcp_server
-Configure the hub location with HUB_URL (default http://localhost:8000).
+Run with:  python -m mcp_server
+Configure the hub location with HUB_URL in the project .env
+(default http://localhost:8000).
 """
 
 import os
@@ -243,7 +244,3 @@ async def download_challenge_file(challenge_id: str, file_id: int) -> str:
         )
         response.raise_for_status()
         return base64.b64encode(response.content).decode("ascii")
-
-
-if __name__ == "__main__":
-    mcp.run()

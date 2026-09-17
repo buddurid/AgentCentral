@@ -46,26 +46,31 @@ Agents never talk to each other. They read from and write to the hub.
 ## Architecture
 
 ```
-┌────────────┐   stdio (MCP)   ┌─────────────────┐   HTTP    ┌──────────────────────┐
-│  Agent /   │ ──────────────> │  app.mcp_server │ ────────> │  FastAPI  (app.main)  │
-│  harness   │                 │  (per machine)  │           │  REST API + Web UI    │
-└────────────┘                 └─────────────────┘           └───────────┬──────────┘
-                                                                          │ SQLAlchemy
-                                                             ┌────────────▼──────────┐
-                                                             │ SQLite  data/ctf.db   │
-                                                             │ files  data/challenges│
-                                                             └───────────────────────┘
+┌────────────┐   stdio (MCP)   ┌───────────────────┐   HTTP    ┌──────────────────────┐
+│  Agent /   │ ──────────────> │  mcp_server       │ ────────> │  FastAPI  (app.main)  │
+│  harness   │                 │  (per machine)    │           │  REST API + Web UI    │
+└────────────┘                 └───────────────────┘           └───────────┬──────────┘
+                                                                           │ SQLAlchemy
+                                                              ┌────────────▼──────────┐
+                                                              │ SQLite  data/ctf.db   │
+                                                              │ files  data/challenges│
+                                                              └───────────────────────┘
 ```
+
+The server (`app/`) and the MCP client (`mcp_server/`) are separate packages;
+the MCP code only talks to the server over HTTP.
 
 ### Components
 
-| File                     | Responsibility                                                        |
-| ------------------------ | --------------------------------------------------------------------- |
-| `app/db.py`              | SQLAlchemy engine/session, three models, tiny auto-migration, `init_db` |
-| `app/main.py`            | FastAPI app: schemas, routes, validation, search, context, file I/O    |
-| `app/__main__.py`        | Entry point (`python -m app`) running uvicorn                          |
-| `app/mcp_server.py`      | MCP tools; each one calls the REST API over HTTP                      |
-| `static/index.html`      | Single-file vanilla-JS UI served at `/`                               |
+| File                       | Responsibility                                                        |
+| -------------------------- | --------------------------------------------------------------------- |
+| `app/db.py`                | SQLAlchemy engine/session, three models, tiny auto-migration, `init_db` |
+| `app/main.py`              | FastAPI app: schemas, routes, validation, search, context, file I/O    |
+| `app/__main__.py`          | Server entry point (`python -m app`) running uvicorn                   |
+| `mcp_server/server.py`     | MCP tools; each one calls the REST API over HTTP                       |
+| `mcp_server/__main__.py`   | MCP entry point (`python -m mcp_server`)                               |
+| `config.py`                | Loads `.env` for both packages                                         |
+| `static/index.html`        | Single-file vanilla-JS UI served at `/`                               |
 | `tests/test_api.py`      | REST tests using FastAPI's `TestClient`                               |
 
 There are deliberately only three models and no service layer.
@@ -115,7 +120,7 @@ no cross-challenge endpoint.
 
 ### MCP design
 
-`app/mcp_server.py` holds **no business logic**. Each tool issues one HTTP request
+`mcp_server/server.py` holds **no business logic**. Each tool issues one HTTP request
 to `HUB_URL` (default `http://localhost:8000`). That means:
 
 - The REST API is the single source of truth.
@@ -129,19 +134,31 @@ to `HUB_URL` (default `http://localhost:8000`). That means:
 
 ```bash
 pip install -r requirements.txt
+cp .env.example .env     # then edit HUB_URL if needed (optional, has defaults)
 python -m app
 ```
 
 Open <http://localhost:8000> for the UI, <http://localhost:8000/docs> for Swagger.
 
-Environment variables:
+### Configuration (`.env`)
+
+Settings are read from a `.env` file in the project root; real environment
+variables take precedence over it. See `.env.example` for the template.
+
+```bash
+# .env
+HUB_URL=http://localhost:8000
+```
 
 | Variable         | Default          | Meaning                              |
 | ---------------- | ---------------- | ------------------------------------ |
-| `HUB_HOST`       | `0.0.0.0`        | Bind address                         |
-| `HUB_PORT`       | `8000`           | Port                                 |
+| `HUB_URL`        | `http://localhost:8000` | Hub REST API URL, used by the MCP server |
+| `HUB_HOST`       | `0.0.0.0`        | Hub server bind address              |
+| `HUB_PORT`       | `8000`           | Hub server port                      |
 | `HUB_DATA_DIR`   | `./data`         | SQLite + file storage                |
-| `HUB_URL`        | —                | Used by the MCP server to find the hub |
+
+Point every agent's `.env` (or their harness MCP `env` block) at the same
+`HUB_URL` so they share one hub.
 
 Run the tests:
 
@@ -266,12 +283,12 @@ and leave it running:
 
 ```bash
 python -m app               # terminal 1 — the hub
-python -m app.mcp_server    # terminal 2 — stdio MCP server (launched by the harness)
+python -m mcp_server    # terminal 2 — stdio MCP server (launched by the harness)
 ```
 
 Point it elsewhere with `HUB_URL` (e.g. a central hub on another host). Each
 agent machine needs a checkout of this repo (or at least the `app/` package) so
-the harness can launch `python -m app.mcp_server`.
+the harness can launch `python -m mcp_server`.
 
 ### Tools
 
@@ -319,7 +336,7 @@ use the Python that has the requirements installed (the repo venv is shown).
       "command": [
         "/ABS/PATH/TO/HUB/.venv/bin/python",
         "-m",
-        "app.mcp_server"
+        "mcp_server"
       ],
       "enabled": true,
       "environment": {
@@ -341,7 +358,7 @@ Restart opencode; tools appear as `ctfhub_get_challenge_context`, etc.
 claude mcp add ctfhub --scope user \
   --env HUB_URL=http://localhost:8000 \
   --env PYTHONPATH=/ABS/PATH/TO/HUB \
-  -- /ABS/PATH/TO/HUB/.venv/bin/python -m app.mcp_server
+  -- /ABS/PATH/TO/HUB/.venv/bin/python -m mcp_server
 ```
 
 Equivalent `.mcp.json`:
@@ -351,7 +368,7 @@ Equivalent `.mcp.json`:
   "mcpServers": {
     "ctfhub": {
       "command": "/ABS/PATH/TO/HUB/.venv/bin/python",
-      "args": ["-m", "app.mcp_server"],
+      "args": ["-m", "mcp_server"],
       "env": {
         "HUB_URL": "http://localhost:8000",
         "PYTHONPATH": "/ABS/PATH/TO/HUB"
@@ -370,7 +387,7 @@ Tools are named `mcp__ctfhub__get_challenge_context`, etc. Verify with `/mcp`.
 ```toml
 [mcp_servers.ctfhub]
 command = "/ABS/PATH/TO/HUB/.venv/bin/python"
-args = ["-m", "app.mcp_server"]
+args = ["-m", "mcp_server"]
 cwd = "/ABS/PATH/TO/HUB"
 env = { HUB_URL = "http://localhost:8000" }
 ```
@@ -381,7 +398,7 @@ Or with the CLI:
 codex mcp add ctfhub \
   --env HUB_URL=http://localhost:8000 \
   --env PYTHONPATH=/ABS/PATH/TO/HUB \
-  -- /ABS/PATH/TO/HUB/.venv/bin/python -m app.mcp_server
+  -- /ABS/PATH/TO/HUB/.venv/bin/python -m mcp_server
 ```
 
 Check with `codex mcp list`, or type `/mcp` inside the Codex TUI.
@@ -390,14 +407,14 @@ Check with `codex mcp list`, or type `/mcp` inside the Codex TUI.
 
 If you installed the requirements globally, replace the interpreter with your
 `python3` path — the `PYTHONPATH`/`cwd` setting still matters so
-`-m app.mcp_server` resolves.
+`-m mcp_server` resolves.
 
 ---
 
 ## Agent instructions
 
 The MCP server embeds an agent-facing prompt (`INSTRUCTIONS` in
-`app/mcp_server.py`) describing the hub workflow: resolve the challenge, read
+`mcp_server/server.py`) describing the hub workflow: resolve the challenge, read
 `get_challenge_context` first, publish findings / dead ends / unconfirmed leads,
 promote or invalidate, and attach files.
 
@@ -427,14 +444,19 @@ can copy the same text into their own `AGENTS.md` / `CLAUDE.md`.
 
 ```
 .
-├── app/
-│   ├── __init__.py
+├── app/                  # FastAPI server
+│   ├── __init__.py       # imports config (loads .env)
 │   ├── __main__.py       # python -m app
 │   ├── db.py             # engine, models, init_db / migration
-│   ├── main.py           # FastAPI app (REST + UI route)
-│   └── mcp_server.py     # MCP tools -> REST API
+│   └── main.py           # FastAPI app (REST + UI route)
+├── mcp_server/           # MCP client / tools
+│   ├── __init__.py       # imports config (loads .env)
+│   ├── __main__.py       # python -m mcp_server
+│   └── server.py         # MCP tools -> REST API
+├── config.py             # shared .env loader
 ├── static/index.html     # web UI
 ├── tests/test_api.py
+├── .env.example          # copy to .env
 ├── requirements.txt
 ├── pytest.ini
 └── README.md
