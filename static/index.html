@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CTF Knowledge Hub</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #14161a; color: #d6dae0; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  header { padding: 12px 20px; border-bottom: 1px solid #2a2e36; background: #1a1d22; }
+  header a { color: #7ec8ff; text-decoration: none; font-weight: 700; letter-spacing: .5px; }
+  main { max-width: 820px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 20px; margin: 8px 0 12px; }
+  .muted { color: #858d99; }
+  .back { color: #858d99; text-decoration: none; font-size: 13px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+  input, textarea, select, button { font: inherit; background: #1e2229; color: #d6dae0; border: 1px solid #333943; border-radius: 4px; padding: 6px 8px; }
+  textarea { min-height: 70px; resize: vertical; width: 100%; }
+  button { cursor: pointer; background: #263041; border-color: #30405a; }
+  button:hover { background: #2e3b50; }
+  button.danger { background: #3a2024; border-color: #5a2d34; }
+  .row input[name=q], .row input[name=name] { flex: 1; min-width: 160px; }
+  .list { display: grid; gap: 10px; }
+  a.card { display: block; padding: 12px 14px; background: #1a1d22; border: 1px solid #2a2e36; border-radius: 6px; text-decoration: none; color: inherit; }
+  a.card:hover { border-color: #3a4557; }
+  .list .title { font-weight: 700; color: #e8ecf1; margin-bottom: 3px; }
+  .tabs { display: flex; gap: 6px; margin: 14px 0; flex-wrap: wrap; }
+  .tabs button.active { background: #35507a; border-color: #4a6ea8; }
+  .entry { background: #1a1d22; border: 1px solid #2a2e36; border-radius: 6px; padding: 12px 14px; margin-bottom: 10px; }
+  .entry .head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+  .entry .meta { color: #858d99; font-size: 12px; }
+  .entry pre { white-space: pre-wrap; word-break: break-word; margin: 8px 0 4px; font: inherit; }
+  .badge { font-size: 11px; padding: 1px 6px; border-radius: 10px; border: 1px solid #3a4557; color: #b8c2d0; }
+  .badge.invalidated { border-color: #5a2d34; color: #e08a95; }
+  .badge.incomplete { border-color: #5a4a2d; color: #e0c98a; }
+  .badge.confirmed { border-color: #2d5a3a; color: #8ae0a4; }
+  .actions { display: flex; gap: 6px; margin-top: 8px; }
+  .actions button { font-size: 12px; padding: 3px 8px; }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { text-align: left; padding: 7px 8px; border-bottom: 1px solid #2a2e36; }
+  a { color: #7ec8ff; }
+</style>
+</head>
+<body>
+<header><a href="#/">CTF Knowledge Hub</a></header>
+<main id="app"></main>
+<script>
+const app = document.getElementById('app');
+const TABS = [['finding','Findings'], ['unconfirmed','Unconfirmed'], ['dead_end','Dead Ends'], ['files','Files']];
+let tab = 'finding';
+let searchTerm = '';
+
+const h = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt = ts => new Date(ts + 'Z').toLocaleString();
+const size = n => n < 1024 ? n + ' B' : n < 1048576 ? (n/1024).toFixed(1) + ' KB' : (n/1048576).toFixed(1) + ' MB';
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  if (!res.ok) {
+    let d = {};
+    try { d = await res.json(); } catch (e) {}
+    throw new Error(d.detail || res.statusText);
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+function json(method, body) {
+  return { method, headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) };
+}
+
+function render() {
+  const m = (location.hash || '#/').match(/^#\/challenge\/(.+)$/);
+  if (m) renderChallenge(decodeURIComponent(m[1]));
+  else renderHome();
+}
+
+async function renderHome() {
+  const challenges = await api('/api/challenges');
+  app.innerHTML = `
+    <h1>Challenges</h1>
+    <form id="new-challenge" class="row">
+      <input name="name" placeholder="challenge name e.g. web-admin" required>
+      <input name="description" placeholder="description (optional)">
+      <button>Create</button>
+    </form>
+    <div class="list">
+      ${challenges.map(c => `
+        <a class="card" href="#/challenge/${encodeURIComponent(c.id)}">
+          <div class="title">${h(c.name)}</div>
+          <div class="muted">Findings: ${c.findings} &middot; Unconfirmed: ${c.unconfirmed} &middot; Dead Ends: ${c.dead_ends} &middot; Files: ${c.files}</div>
+        </a>`).join('') || '<p class="muted">No challenges yet.</p>'}
+    </div>`;
+  document.getElementById('new-challenge').onsubmit = async e => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    await api('/api/challenges', json('POST', {name: f.get('name'), description: f.get('description')}));
+    e.target.reset();
+    render();
+  };
+}
+
+async function renderChallenge(id) {
+  const base = '/api/challenges/' + encodeURIComponent(id);
+  const c = await api(base);
+  let entries = await api(base + '/entries');
+  const files = await api(base + '/files');
+  if (searchTerm) entries = await api(base + '/search?q=' + encodeURIComponent(searchTerm));
+  const counts = {finding: c.findings, unconfirmed: c.unconfirmed, dead_end: c.dead_ends, files: c.files};
+  const shown = tab === 'files' ? [] : entries.filter(e => e.type === tab);
+
+  app.innerHTML = `
+    <a class="back" href="#/">&larr; Challenges</a>
+    <h1>${h(c.name)}</h1>
+    ${c.description ? `<p class="muted">${h(c.description)}</p>` : ''}
+    <div class="tabs">
+      ${TABS.map(([k, label]) => `<button data-tab="${k}" class="${tab === k ? 'active' : ''}">${label} (${counts[k]})</button>`).join('')}
+    </div>
+    ${tab === 'files' ? filesView(base, files) : entriesView(entries, shown)}`;
+
+  app.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { tab = b.dataset.tab; searchTerm = ''; renderChallenge(id); });
+
+  const search = app.querySelector('#search');
+  if (search) search.onsubmit = e => {
+    e.preventDefault();
+    searchTerm = new FormData(e.target).get('q').trim();
+    renderChallenge(id);
+  };
+
+  const create = app.querySelector('#create-entry');
+  if (create) create.onsubmit = async e => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    await api(base + '/entries', json('POST', {type: f.get('type'), title: f.get('title'), content: f.get('content'), author: f.get('author')}));
+    renderChallenge(id);
+  };
+
+  app.querySelectorAll('[data-action]').forEach(btn => btn.onclick = async () => {
+    const eid = btn.dataset.id;
+    if (btn.dataset.action === 'delete') await api(base + '/entries/' + eid, {method: 'DELETE'});
+    if (btn.dataset.action === 'confirm') await api('/api/entries/' + eid + '/confirm', {method: 'POST'});
+    if (btn.dataset.action === 'invalidate') await api('/api/entries/' + eid + '/invalidate', {method: 'POST'});
+    renderChallenge(id);
+  });
+
+  const upload = app.querySelector('#upload');
+  if (upload) upload.onsubmit = async e => {
+    e.preventDefault();
+    await api(base + '/files', {method: 'POST', body: new FormData(e.target)});
+    renderChallenge(id);
+  };
+
+  app.querySelectorAll('[data-del-file]').forEach(btn => btn.onclick = async () => {
+    await api(base + '/files/' + btn.dataset.delFile, {method: 'DELETE'});
+    renderChallenge(id);
+  });
+
+  const del = app.querySelector('#delete-challenge');
+  if (del) del.onclick = async () => {
+    if (!confirm('Delete this challenge and all its entries and files?')) return;
+    await api(base, {method: 'DELETE'});
+    location.hash = '#/';
+    render();
+  };
+}
+
+function entriesView(entries, shown) {
+  const createType = tab === 'unconfirmed' ? 'unconfirmed' : tab;
+  return `
+    <form id="search" class="row">
+      <input name="q" placeholder="search title, content, author" value="${h(searchTerm)}">
+      <button>Search</button>
+    </form>
+    <form id="create-entry" class="row" style="flex-direction:column">
+      <div class="row" style="margin:0">
+        <select name="type">
+          <option value="finding" ${createType === 'finding' ? 'selected' : ''}>finding</option>
+          <option value="unconfirmed" ${createType === 'unconfirmed' ? 'selected' : ''}>unconfirmed</option>
+          <option value="dead_end" ${createType === 'dead_end' ? 'selected' : ''}>dead_end</option>
+        </select>
+        <input name="title" placeholder="title" required style="flex:1">
+        <input name="author" placeholder="author e.g. agent-a" style="width:140px">
+      </div>
+      <textarea name="content" placeholder="what did you learn?"></textarea>
+      <button>Publish</button>
+    </form>
+    ${searchTerm ? `<p class="muted">Showing matches for "${h(searchTerm)}" in this tab.</p>` : ''}
+    ${shown.map(entryView).join('') || '<p class="muted">Nothing here yet.</p>'}`;
+}
+
+function entryView(e) {
+  const actions = [];
+  if (e.type === 'unconfirmed') {
+    actions.push(`<button data-action="confirm" data-id="${e.id}">Confirm</button>`);
+    if (e.status !== 'invalidated') actions.push(`<button data-action="invalidate" data-id="${e.id}">Invalidate</button>`);
+  }
+  actions.push(`<button class="danger" data-action="delete" data-id="${e.id}">Delete</button>`);
+  const status = e.type === 'unconfirmed' ? `<span class="badge ${e.status}">${e.status}</span>` : '';
+  const who = [e.author || 'anonymous', e.client_host].filter(Boolean).join(' @ ');
+  return `
+    <div class="entry">
+      <div class="head">
+        <div><strong>${h(e.title)}</strong> <span class="badge">${e.type}</span> ${status}</div>
+        <div class="meta">${h(who)} &middot; ${fmt(e.created_at)}</div>
+      </div>
+      <pre>${h(e.content)}</pre>
+      <div class="actions">${actions.join('')}</div>
+    </div>`;
+}
+
+function filesView(base, files) {
+  return `
+    <form id="upload" class="row">
+      <input type="file" name="file" required>
+      <button>Upload</button>
+    </form>
+    ${files.length ? `<table>
+      <tr><th>File</th><th>Size</th><th>Added</th><th></th></tr>
+      ${files.map(f => `<tr>
+        <td><a href="${base}/files/${f.id}">${h(f.filename)}</a></td>
+        <td class="muted">${size(f.size)}</td>
+        <td class="muted">${fmt(f.created_at)}</td>
+        <td><button class="danger" data-del-file="${f.id}">Delete</button></td>
+      </tr>`).join('')}
+    </table>` : '<p class="muted">No files yet.</p>'}
+    <div class="actions"><button class="danger" id="delete-challenge">Delete challenge</button></div>`;
+}
+
+window.addEventListener('hashchange', render);
+render().catch(err => { app.innerHTML = '<p class="muted">Error: ' + h(err.message) + '</p>'; });
+</script>
+</body>
+</html>
