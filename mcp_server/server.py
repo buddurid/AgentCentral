@@ -79,6 +79,12 @@ names below are the suffixes.
    Do not wait for the flag to publish. Partial, confirmed progress is exactly
    what teammates need.
 
+   `publish_finding` and `confirm_entry` are checked by the hub before they are
+   stored. A rejection means the finding was a duplicate, stale, erroneous or
+   malformed — the error names the category and why. Do not retry it verbatim:
+   either publish it as `unconfirmed` with the extra evidence that makes it
+   solid, or rework it into knowledge the team does not already have.
+
 5. **Keep the record honest.**
    - Verified an unconfirmed lead -> `confirm_entry(entry_id)` (becomes a
      finding).
@@ -121,9 +127,15 @@ mcp = MCPServer("ctfhub", instructions=INSTRUCTIONS)
 
 
 async def _request(method: str, path: str, **kwargs):
-    async with httpx.AsyncClient(base_url=HUB_URL, timeout=30) as client:
+    async with httpx.AsyncClient(base_url=HUB_URL, timeout=120) as client:
         response = await client.request(method, path, **kwargs)
-        response.raise_for_status()
+        if response.status_code >= 400:
+            detail = response.text
+            try:
+                detail = response.json().get("detail", detail)
+            except Exception:  # noqa: BLE001
+                pass
+            raise RuntimeError(f"{response.status_code} from hub: {detail}")
         if response.headers.get("content-type", "").startswith("application/json"):
             return response.json()
         return response.text

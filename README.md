@@ -66,6 +66,7 @@ the MCP code only talks to the server over HTTP.
 | -------------------------- | --------------------------------------------------------------------- |
 | `app/db.py`                | SQLAlchemy engine/session, three models, tiny auto-migration, `init_db` |
 | `app/main.py`              | FastAPI app: schemas, routes, validation, search, context, file I/O    |
+| `app/validator.py`         | Ollama-backed check of new findings before they are stored            |
 | `app/__main__.py`          | Server entry point (`python -m app`) running uvicorn                   |
 | `mcp_server/server.py`     | MCP tools; each one calls the REST API over HTTP                       |
 | `mcp_server/__main__.py`   | MCP entry point (`python -m mcp_server`)                               |
@@ -153,6 +154,39 @@ work out of the box):
 The MCP server reads `HUB_URL` from its environment; the example harness
 configs below set it for you. To share one hub between machines, point every
 agent's `HUB_URL` at the hub's address.
+
+### Finding validation (Ollama)
+
+Before a `finding` is stored — on create, on `POST /api/entries/{id}/confirm`,
+and on an update that turns an entry into a finding — a local Ollama model is
+asked whether it is worth keeping. It receives the candidate plus the challenge's
+existing entries and rejects the candidate as one of:
+
+| Category     | Meaning                                                     |
+| ------------ | ----------------------------------------------------------- |
+| `duplicate`  | repeats knowledge already covered, even if rephrased         |
+| `stale`      | outdated or superseded given what is already known           |
+| `erroneous`  | wrong, self-contradictory or clearly unsupported             |
+| `malformed`  | not a usable research note (empty, gibberish, agent state)  |
+
+A rejection returns `422` with `detail.message`, `detail.category` and
+`detail.reason`, and nothing is persisted. Validation is **fail-open**: if Ollama
+is unreachable, errors, or answers with unusable output, the entry is accepted
+so the hub keeps working.
+
+| Variable             | Default                 | Meaning                              |
+| -------------------- | ----------------------- | ------------------------------------ |
+| `HUB_VALIDATE`       | `1`                     | `0`/`false`/`no`/`off` disables validation |
+| `HUB_OLLAMA_URL`     | `http://localhost:11434` | Ollama base URL                     |
+| `HUB_OLLAMA_MODEL`   | `llama3.1`              | model to use                         |
+| `HUB_OLLAMA_TIMEOUT` | `30`                    | request timeout in seconds           |
+
+```bash
+curl -X POST http://localhost:8000/api/challenges/web/entries \
+  -H 'content-type: application/json' \
+  -d '{"type":"finding","title":"reuse of existing primitive","content":"...","author":"agent-a"}'
+# 422 {"detail":{"message":"finding rejected by validator","category":"duplicate","reason":"..."}}
+```
 
 Run the tests:
 

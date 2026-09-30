@@ -14,6 +14,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from .db import DATA_DIR, Challenge, Entry, File, get_db, init_db
+from .validator import validate_finding
 
 ENTRY_TYPES = {"finding", "dead_end", "unconfirmed"}
 ENTRY_STATUSES = {"confirmed", "incomplete", "invalidated"}
@@ -248,12 +249,52 @@ def delete_challenge(challenge_id: str, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------- entries
 
 
+def guard_finding(
+    db: Session,
+    challenge_id: str,
+    candidate: dict,
+    exclude_entry_id: int | None = None,
+):
+    """Validate a candidate finding against the challenge's other entries.
+
+    Raises 422 with the validator's category and reason if it is rejected.
+    Validation is fail-open, so this only raises on an actual rejection.
+    """
+    query = db.query(Entry).filter(Entry.challenge_id == challenge_id)
+    if exclude_entry_id is not None:
+        query = query.filter(Entry.id != exclude_entry_id)
+    existing = [
+        {"type": e.type, "status": e.status, "title": e.title, "content": e.content}
+        for e in query.order_by(Entry.created_at.desc()).all()
+    ]
+    verdict = validate_finding(candidate, existing)
+    if not verdict.ok:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "finding rejected by validator",
+                "category": verdict.category,
+                "reason": verdict.reason,
+            },
+        )
+
+
 @app.post("/api/challenges/{challenge_id}/entries", status_code=201)
 def create_entry(
     challenge_id: str, payload: EntryCreate, db: Session = Depends(get_db)
 ):
     get_challenge_or_404(db, challenge_id)
     status = validate_type_status(payload.type, None)
+    if payload.type == "finding":
+        guard_finding(
+            db,
+            challenge_id,
+            {
+                "title": payload.title,
+                "content": payload.content,
+                "author": payload.author,
+            },
+        )
     entry = Entry(
         challenge_id=challenge_id,
         type=payload.type,
@@ -303,15 +344,24 @@ def update_entry(
     new_type = payload.type or entry.type
     status = payload.status if payload.status is not None else entry.status
     validate_type_status(new_type, status)
+    new_title = payload.title if payload.title is not None else entry.title
+    new_content = payload.content if payload.content is not None else entry.content
+    text_changed = (new_title, new_content) != (entry.title, entry.content)
+    # Editing an entry into (or within) a finding is validated like a new finding
+    if new_type == "finding" and (entry.type != "finding" or text_changed):
+        guard_finding(
+            db,
+            entry.challenge_id,
+            {"title": new_title, "content": new_content, "author": entry.author},
+            exclude_entry_id=entry.id,
+        )
     entry.type = new_type
     if new_type in ("finding", "dead_end"):
         entry.status = "confirmed"
     else:
         entry.status = status
-    if payload.title is not None:
-        entry.title = payload.title
-    if payload.content is not None:
-        entry.content = payload.content
+    entry.title = new_title
+    entry.content = new_content
     if payload.author is not None:
         entry.author = payload.author
     if payload.file_ids is not None:
@@ -333,6 +383,13 @@ def confirm_entry(entry_id: int, db: Session = Depends(get_db)):
     entry = db.get(Entry, entry_id)
     if entry is None:
         raise HTTPException(status_code=404, detail="entry not found")
+    # Validate as finding before promoting
+    guard_finding(
+        db,
+        entry.challenge_id,
+        {"title": entry.title, "content": entry.content, "author": entry.author},
+        exclude_entry_id=entry.id,
+    )
     entry.type = "finding"
     entry.status = "confirmed"
     db.commit()

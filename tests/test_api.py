@@ -2,6 +2,7 @@ import os
 import tempfile
 
 os.environ["HUB_DATA_DIR"] = tempfile.mkdtemp(prefix="hub-test-")
+os.environ["HUB_VALIDATE"] = "0"
 
 from fastapi.testclient import TestClient
 
@@ -177,3 +178,74 @@ def test_entry_records_client_host():
 def test_entry_client_host_defaults_empty():
     cid = make_challenge("t-host-empty")
     assert make_entry(cid, "finding", "no host")["client_host"] == ""
+
+
+def test_finding_rejected_by_validator(monkeypatch):
+    from app import main
+    from app.validator import Verdict
+
+    cid = make_challenge("t-validator")
+    monkeypatch.setattr(
+        main,
+        "validate_finding",
+        lambda candidate, existing: Verdict(
+            ok=False, category="duplicate", reason="already known"
+        ),
+    )
+    res = client.post(
+        f"/api/challenges/{cid}/entries",
+        json={"type": "finding", "title": "dup", "content": "x", "author": "a"},
+    )
+    assert res.status_code == 422
+    assert res.json()["detail"]["category"] == "duplicate"
+
+    # nothing was persisted
+    assert client.get(f"/api/challenges/{cid}/entries").json() == []
+
+
+def test_confirm_rejected_by_validator(monkeypatch):
+    from app import main
+    from app.validator import Verdict
+
+    cid = make_challenge("t-validator-confirm")
+    entry = make_entry(cid, "unconfirmed", "hunch")
+    monkeypatch.setattr(
+        main,
+        "validate_finding",
+        lambda candidate, existing: Verdict(
+            ok=False, category="erroneous", reason="unproven"
+        ),
+    )
+    res = client.post(f"/api/entries/{entry['id']}/confirm")
+    assert res.status_code == 422
+    assert res.json()["detail"]["category"] == "erroneous"
+
+    # still unconfirmed, not promoted
+    body = client.get(f"/api/challenges/{cid}/entries/{entry['id']}").json()
+    assert body["type"] == "unconfirmed"
+    assert body["status"] == "incomplete"
+
+
+def test_update_into_finding_is_validated(monkeypatch):
+    from app import main
+    from app.validator import Verdict
+
+    cid = make_challenge("t-validator-update")
+    entry = make_entry(cid, "unconfirmed", "hunch")
+    monkeypatch.setattr(
+        main,
+        "validate_finding",
+        lambda candidate, existing: Verdict(
+            ok=False, category="malformed", reason="not a note"
+        ),
+    )
+    res = client.put(
+        f"/api/challenges/{cid}/entries/{entry['id']}",
+        json={"type": "finding", "title": "now a finding", "content": "body"},
+    )
+    assert res.status_code == 422
+    assert res.json()["detail"]["category"] == "malformed"
+
+    body = client.get(f"/api/challenges/{cid}/entries/{entry['id']}").json()
+    assert body["type"] == "unconfirmed"
+    assert body["title"] == "hunch"
