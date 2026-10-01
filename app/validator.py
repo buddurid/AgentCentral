@@ -118,6 +118,7 @@ def validate_finding(candidate: dict, existing: list[dict]) -> Verdict:
                     ],
                 },
             )
+            print(response.json())
             response.raise_for_status()
             content = response.json()["message"]["content"]
         data = json.loads(content)
