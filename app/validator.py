@@ -91,6 +91,7 @@ def _existing_text(existing: list[dict]) -> str:
 def validate_finding(candidate: dict, existing: list[dict]) -> Verdict:
     """Return a Verdict for a candidate `finding`. Never raises."""
     if not _enabled():
+        print("validation disabled")
         return Verdict(ok=True, reason="validation disabled")
 
     user_message = (
