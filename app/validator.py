@@ -93,7 +93,7 @@ def validate_finding(candidate: dict, existing: list[dict]) -> Verdict:
     if not _enabled():
         print("validation disabled")
         return Verdict(ok=True, reason="validation disabled")
-
+    print("validation enabled")
     user_message = (
         "CANDIDATE\n"
         f"title: {candidate.get('title', '')}\n"
