@@ -181,6 +181,18 @@ Scope and comparison set:
 - Findings are compared in batches; if any batch reports a duplicate the
   candidate is rejected.
 
+Two details matter for small models, which are the ones actually used here:
+
+- **The model is never asked for a boolean.** It answers `{"duplicate_of": <id
+  or null>, "reason": "..."}` and `ok` is derived in code. A small model will
+  otherwise answer `"ok": true` while its reason says the candidate is the same
+  knowledge as an existing finding. An answer also counts as a duplicate when
+  the reason names a finding (`#7`) even if `duplicate_of` is missing or wrong.
+- **A rejection is re-checked.** Before an entry is dropped, the model is asked
+  again about that one pair (candidate vs. the single finding it duplicates).
+  Only if it agrees a second time is the entry rejected, so a small model cannot
+  quietly delete new knowledge (`HUB_VALIDATE_CONFIRM=0` to switch off).
+
 A rejection returns `422` and nothing is persisted:
 
 ```json
@@ -205,7 +217,9 @@ has no findings yet, no model call is made at all.
 | `HUB_OLLAMA_MODEL`       | `llama3.1`              | model to use                             |
 | `HUB_OLLAMA_TIMEOUT`     | `30`                    | request timeout in seconds               |
 | `HUB_VALIDATE_BATCH`     | `25`                    | existing findings per model call         |
+| `HUB_VALIDATE_CONFIRM`   | `1`                     | second check before rejecting            |
 | `HUB_VALIDATE_MAX_CHARS` | `2000`                  | max characters kept per entry            |
+| `HUB_VALIDATE_DEBUG`     | `0`                     | `1` prints every model answer            |
 
 ```bash
 curl -X POST http://localhost:8000/api/challenges/web/entries \

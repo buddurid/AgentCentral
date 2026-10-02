@@ -27,6 +27,7 @@ Validation never raises.
 
 import json
 import os
+import re
 from dataclasses import dataclass
 
 import httpx
@@ -38,28 +39,42 @@ DEFAULT_BATCH = 25
 DEFAULT_MAX_CHARS = 2000
 
 SYSTEM_PROMPT = (
-    "You check whether a new CTF finding is already known to the team.\n\n"
-    "You are given a CANDIDATE finding and a list of EXISTING findings from the "
-    "same challenge. Reject the candidate only if it is a duplicate.\n\n"
-    "It IS a duplicate when it conveys the same knowledge as an existing "
+    "You decide whether a new CTF finding is already known to the team.\n\n"
+    "You get a CANDIDATE finding and EXISTING findings from the same challenge, "
+    "each labelled with its id like [#7].\n\n"
+    "The candidate IS a duplicate when it states the same result as an existing "
     "finding: the same conclusion, the same observation, the same primitive, or "
-    "the same link in an exploit chain. That holds even when the text is worded "
-    "differently, paraphrased, translated, uses different variable names, "
-    "endpoints, functions, offsets, gadgets or payloads, or is more or less "
-    "verbose. Compare meaning and result, never literal strings or titles.\n\n"
-    "It is NOT a duplicate when it adds anything new, for example:\n"
-    "- a different endpoint, parameter, function or code path\n"
-    "- a different technique, primitive, offset, gadget or workaround\n"
-    "- an extra link in a chain, or a chain where only one link was known\n"
-    "- a broader or narrower claim that extends the existing finding\n"
-    "- a correction, refinement or qualification of the existing finding\n"
-    "- evidence, a payload or output the existing finding did not have\n"
-    "An existing finding may be vague or incomplete; vagueness alone is not a "
-    "duplicate.\n\n"
-    "Reply with ONLY a JSON object and no other text:\n"
-    '{"ok": true, "category": "none", "reason": "<brief reason>"}\n'
-    'When it is a duplicate reply ok=false, category="duplicate", reason="<same '
-    'knowledge as existing finding #<id>: what it already covers>".'
+    "the same link in an exploit chain. That is still true when the wording, "
+    "variable names, endpoint, function, offset or payload differ, or when one "
+    "is just a paraphrase or a longer version of the other. Compare the result, "
+    "not the words.\n\n"
+    "The candidate is NOT a duplicate when it states something the team does not "
+    "know yet: a different endpoint or code path, a different technique or "
+    "primitive, one more link in a chain, a wider or narrower claim, a "
+    "correction, or a detail (evidence, payload, output) the existing finding "
+    "left out.\n\n"
+    "Answer with ONLY a JSON object with these two keys and nothing else:\n"
+    '{"duplicate_of": <id of the existing finding that already covers it, or '
+    'null>, "reason": "<one short sentence>"}\n\n'
+    "The two rules that matter most:\n"
+    "1. If your reason says the candidate covers the same knowledge as some "
+    "existing finding, duplicate_of MUST be that finding's id. Never null then.\n"
+    "2. duplicate_of MUST be null only when the candidate adds knowledge that no "
+    "existing finding states.\n\n"
+    "Example - duplicate:\n"
+    'Existing finding [#4]: "the libc base can be read from the buffer returned '
+    'by GET /api/export".\n'
+    'Candidate: "GET /api/export hands back a pointer to __libc_start_main, so '
+    'the libc base leaks from that route".\n'
+    'Answer: {"duplicate_of": 4, "reason": "both state that /api/export leaks '
+    'the libc base"}\n\n'
+    "Example - new knowledge:\n"
+    'Existing finding [#4]: "the libc base can be read from the buffer returned '
+    'by GET /api/export".\n'
+    'Candidate: "the same buffer from GET /api/export also contains a '
+    '/bin/sh pointer, one_gadget 0x4f3c5 works on this build".\n'
+    'Answer: {"duplicate_of": null, "reason": "adds the /bin/sh pointer and a '
+    'working one_gadget offset"}'
 )
 
 
@@ -72,7 +87,11 @@ class Verdict:
 
 
 def _enabled() -> bool:
-    return os.environ.get("HUB_VALIDATE", "1").strip().lower() not in (
+    return _enabled_env("HUB_VALIDATE")
+
+
+def _enabled_env(name: str) -> bool:
+    return os.environ.get(name, "1").strip().lower() not in (
         "0",
         "false",
         "no",
@@ -89,6 +108,15 @@ def _int_env(name: str, default: int) -> int:
 
 def _timeout() -> float:
     return float(os.environ.get("HUB_OLLAMA_TIMEOUT", "30"))
+
+
+def _debug() -> bool:
+    return os.environ.get("HUB_VALIDATE_DEBUG", "0").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
 
 def _clip(text: str | None) -> str:
@@ -140,15 +168,71 @@ def _ask_model(candidate: dict, batch: list[dict]) -> Verdict:
             },
         )
         response.raise_for_status()
-        print(response.json())  # debug
-        data = json.loads(response.json()["message"]["content"])
+        raw = response.json()
+    if _debug():
+        print(f"[validator] {raw}")
+    return _parse(raw["message"]["content"], batch)
+
+
+def _parse(content: str, batch: list[dict]) -> Verdict:
+    """Turn the model's answer into a Verdict.
+
+    A small model cannot be trusted with a boolean: it will happily answer
+    "ok": true while the reason says the candidate is the same knowledge as an
+    existing finding. So the answer is only treated as a duplicate when it names
+    the finding that already covers it - either in `duplicate_of`, or as a "#id"
+    reference inside the reason, or by an explicit false/true duplicate flag.
+    """
+    try:
+        data = json.loads(content)
+    except (TypeError, ValueError):
+        raise ValueError("model did not answer with JSON")
+    if not isinstance(data, dict):
+        raise ValueError("model answer was not a JSON object")
+
+    reason = str(data.get("reason", "") or "")
+
+    known_ids = {e.get("id") for e in batch}
+    mentioned = [int(n) for n in re.findall(r"#(\d+)", reason)]
+
     duplicate_of = data.get("duplicate_of")
-    return Verdict(
-        ok=bool(data.get("ok", True)),
-        category=data.get("category") or None,
-        reason=str(data.get("reason", "")),
-        duplicate_of=duplicate_of if isinstance(duplicate_of, int) else None,
+    if isinstance(duplicate_of, bool) or not isinstance(duplicate_of, int):
+        duplicate_of = None
+    if duplicate_of not in known_ids:
+        # the id was left out, or invented: fall back to one named in the reason
+        duplicate_of = next((m for m in mentioned if m in known_ids), None)
+
+    says_duplicate = (
+        duplicate_of is not None
+        or data.get("duplicate") is True
+        or data.get("is_duplicate") is True
+        or data.get("ok") is False
+        or bool(mentioned)
     )
+    if says_duplicate and duplicate_of is None:
+        # a duplicate of the batch, but it did not say which one
+        duplicate_of = batch[0].get("id")
+
+    return Verdict(
+        ok=not says_duplicate,
+        category="duplicate" if says_duplicate else None,
+        reason=reason,
+        duplicate_of=duplicate_of if says_duplicate else None,
+    )
+
+
+def _confirm_duplicate(candidate: dict, entry: dict) -> bool:
+    """Second opinion on one candidate/finding pair before dropping it.
+
+    Small models jump at "same" as well. A rejection only counts when a second,
+    narrower pass - the candidate against that single finding - agrees. Any
+    failure to get an answer counts as "not a duplicate" so real knowledge is
+    never lost to a flaky model.
+    """
+    try:
+        return _ask_model(candidate, [entry]).duplicate_of is not None
+    except Exception:  # noqa: BLE001 - fail open, keep the entry
+        return False
 
 
 def validate_finding(candidate: dict, existing: list[dict]) -> Verdict:
@@ -161,7 +245,8 @@ def validate_finding(candidate: dict, existing: list[dict]) -> Verdict:
         return Verdict(ok=True, reason="no existing finding to duplicate")
 
     size = max(1, _int_env("HUB_VALIDATE_BATCH", DEFAULT_BATCH))
-    accepted = 0
+    double_check = _enabled_env("HUB_VALIDATE_CONFIRM")
+    compared = 0
     for start in range(0, len(findings), size):
         batch = findings[start : start + size]
         try:
@@ -171,15 +256,26 @@ def validate_finding(candidate: dict, existing: list[dict]) -> Verdict:
                 ok=True,
                 reason=f"validator unavailable, accepted: {exc}",
             )
-        if not verdict.ok:
-            return Verdict(
-                ok=False,
-                category=verdict.category or "duplicate",
-                reason=verdict.reason,
-                duplicate_of=verdict.duplicate_of,
-            )
-        accepted += len(batch)
+        compared += len(batch)
+        if verdict.ok:
+            continue
+
+        match = next(
+            (e for e in batch if e.get("id") == verdict.duplicate_of), None
+        )
+        if double_check and (match is None or not _confirm_duplicate(candidate, match)):
+            if _debug():
+                print(f"[validator] not a duplicate after re-check: {verdict.reason}")
+            continue
+
+        return Verdict(
+            ok=False,
+            category="duplicate",
+            reason=verdict.reason
+            or f"same knowledge as existing finding #{verdict.duplicate_of}",
+            duplicate_of=verdict.duplicate_of,
+        )
 
     return Verdict(
-        ok=True, reason=f"new knowledge, not covered by {accepted} existing finding(s)"
+        ok=True, reason=f"new knowledge, not covered by {compared} existing finding(s)"
     )
