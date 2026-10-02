@@ -33,14 +33,18 @@ How a candidate is decided (in order):
    is rejected outright, with no model call.
 2. The judge answers {"closest": <id or null>, "duplicate_of": <id or null>,
    "reason": "..."} against everything the session knows - a single turn,
-   since the full list is already in the conversation.
-3. A contradictory or vague answer (a valid `closest` with null `duplicate_of`,
-   a duplicate claim with no usable id) is *not* trusted. The named pair is
-   re-asked with a short yes/no question, and its answer decides.
+   since the full list is already in the conversation. Only a valid id in
+   `duplicate_of` counts as a duplicate.
+3. A contradictory or vague judge answer is *not* trusted. The named pair is
+   re-asked with a short yes/no question, and its answer decides. A clean
+   answer whose prose still mentions a shared distinctive token (the model
+   saying "same thing" while outputting null) goes to the re-check too.
 4. Only a confirmed duplicate rejects the candidate.
 
-Small models contradict themselves, so a rejection always names a real finding
-id and always passes the yes/no re-check on that one pair.
+Small models contradict themselves, so a rejection always names a real
+finding id and always passes the yes/no re-check on that one pair. With a
+capable model the judge's id is usually right first time and the re-check
+just confirms it.
 
 Configuration (environment variables, read per call):
 
@@ -49,7 +53,7 @@ Configuration (environment variables, read per call):
     HUB_OLLAMA_MODEL=...      model name (default llama3.1)
     HUB_OLLAMA_TIMEOUT=30     request timeout in seconds
     HUB_OLLAMA_CTX=8192       model context window requested
-    HUB_VALIDATE_BATCH=25     findings judged per turn
+    HUB_VALIDATE_BATCH=25     findings judged per turn (stateless fallback)
     HUB_VALIDATE_CONFIRM=1    re-check a duplicate before dropping it
     HUB_VALIDATE_HISTORY=16000  max stored conversation chars per challenge
     HUB_VALIDATE_MAX_CHARS=2000   max characters kept per entry
@@ -80,6 +84,20 @@ DEFAULT_CTX = 8192
 MAX_SESSIONS = 200
 NEAR_DUP_RATIO = 0.9
 NEAR_DUP_MIN_CHARS = 60
+
+# Common English words carry no signal about sameness.
+STOPWORDS = frozenset(
+    "the a an and or of to in on for with is are was were be been this that "
+    "these those it its as at by from we you they he she him her our your "
+    "not no so do does did can will just about into over after before up out "
+    "all any more most other some such only own same than too very can will "
+    "should would could there here when where which who whom what how why "
+    "look looks looked looking see found find finds get got gets let lets "
+    "like use used using stuff thing things".split()
+)
+
+_COMPOUND_RE = re.compile(r"[a-z0-9]+(?:[._/\-][a-z0-9]+)+")
+_SIMPLE_RE = re.compile(r"[a-z0-9]{3,}")
 
 JUDGE_SCHEMA = {
     "type": "object",
@@ -141,6 +159,8 @@ CONFIRM_PROMPT = (
     "A: the same conclusion, observation or leak, even if worded differently "
     "or with different names? If B only completes what A said to look for, "
     "that is the same result.\n\n"
+    'Example: A says "look for the file flag-12345.txt", B says "found '
+    'flag-12345.txt" -> {"same": true}.\n\n'
     'Answer with ONLY a JSON object: {"same": true, "reason": "<what both '
     'state>"} or {"same": false, "reason": "<what B adds>"}.'
 )
@@ -222,6 +242,67 @@ def _clip(text: str | None) -> str:
 
 def _normalize(text: str | None) -> str:
     return re.sub(r"\s+", " ", (text or "").lower()).strip()
+
+
+def _entry_text(entry: dict) -> str:
+    return f"{entry.get('title', '')}\n{entry.get('content', '')}"
+
+
+def _tokens(text: str | None) -> list[str]:
+    """Distinctive tokens: dotted/hyphenated compounds kept whole
+    ("flag-12345.txt", "/api/export"), plus plain words without stopwords."""
+    low = (text or "").lower()
+    compounds = _COMPOUND_RE.findall(low)
+    rest = _COMPOUND_RE.sub(" ", low)
+    simples = [t for t in _SIMPLE_RE.findall(rest) if t not in STOPWORDS]
+    return compounds + simples
+
+
+def _token_weight(token: str) -> float:
+    """Absolute distinctiveness: digits, length and separators signal a
+    filename, secret, endpoint or identifier rather than prose."""
+    weight = 1.0
+    if any(c.isdigit() for c in token):
+        weight += 2.0
+    if len(token) >= 8:
+        weight += 1.0
+    if any(c in token for c in "._/-"):
+        weight += 1.0
+    return weight
+
+
+def _links(candidate: dict, findings: list[dict]) -> list[tuple[str, int]]:
+    """(token, finding id) for the candidate's link tokens - digit-bearing,
+    compound or long tokens - each pointing at a finding containing it.
+
+    Used as a tripwire: when the judge's prose mentions one of these while
+    outputting null (the "new finding about the same thing" failure), the
+    pair goes to the re-check instead of being accepted.
+    """
+    cand_tokens = [
+        t for t in set(_tokens(_entry_text(candidate))) if _is_link_token(t)
+    ]
+    cand_tokens.sort(key=lambda t: -_token_weight(t))
+    links = []
+    for token in cand_tokens:
+        for entry in findings:
+            eid = entry.get("id")
+            if (
+                isinstance(eid, int)
+                and not isinstance(eid, bool)
+                and token in set(_tokens(_entry_text(entry)))
+            ):
+                links.append((token, eid))
+                break
+    return links
+
+
+def _is_link_token(token: str) -> bool:
+    return (
+        any(c.isdigit() for c in token)
+        or any(c in token for c in "._/-")
+        or len(token) >= 10
+    )
 
 
 def _history_chars(messages: list[dict]) -> int:
@@ -397,15 +478,20 @@ def _valid_id(value: Any, known_ids: set) -> int | None:
     return value if value in known_ids else None
 
 
-def _read_answer(content: str, known_ids: set) -> _Reading:
+def _read_answer(
+    content: str, known_ids: set, links: list[tuple[str, int]] | None = None
+) -> _Reading:
     """Decide what the judge's answer means. Raises ValueError when the answer
     carries no judgement at all (not a verdict - a validator failure).
 
     Only a valid id in `duplicate_of` is a definite duplicate. A valid
     `closest` with null `duplicate_of` - or a named [#id] without a usable
     id - is "unclear": the model hedged or contradicted itself, so the named
-    pair gets the yes/no re-check. Only bracketed [#id] references count, so
-    a port #8080 or an issue #12 in a reason can never flip a verdict.
+    pair gets the yes/no re-check. The same tripwire fires when the prose
+    mentions a shared distinctive token ("about the same thing as ... holding
+    flag-12345.txt") while outputting null: the pair, not the prose, decides.
+    Only bracketed [#id] references count, so a port #8080 or an issue #12 in
+    a reason can never flip a verdict.
     """
     data = _decode(content)
     reason = str(data.get("reason", "") or "")
@@ -440,6 +526,13 @@ def _read_answer(content: str, known_ids: set) -> _Reading:
 
     if not reason.strip():
         raise ValueError("model answer carried no judgement")
+
+    lowered = reason.lower()
+    for token, holder in links or []:
+        if holder in known_ids and token in lowered:
+            # the prose betrays sameness ("about the same thing as ... holding
+            # flag-12345.txt") while the ids say null: re-check, don't accept
+            return _Reading("unclear", holder, reason)
     return _Reading("clean", None, reason)
 
 
@@ -537,13 +630,16 @@ def validate_finding(candidate: dict, existing: list[dict]) -> Verdict:
     confirm = _flag("HUB_VALIDATE_CONFIRM")
     size = max(1, _int_env("HUB_VALIDATE_BATCH", DEFAULT_BATCH))
     system = {"role": "system", "content": SYSTEM_PROMPT}
+    links = _links(candidate, findings)
 
-    def judge(base: list[dict], user_message: str, known_ids: set) -> _Reading:
+    def judge(
+        base: list[dict], user_message: str, known_ids: set
+    ) -> _Reading:
         raw = _chat([*base, {"role": "user", "content": user_message}], JUDGE_SCHEMA)
         if _debug():
             print(f"[validator] {_chat_state['index']} {raw}")
         content = raw["message"]["content"]
-        reading = _read_answer(content, known_ids)
+        reading = _read_answer(content, known_ids, links)
         return reading, content
 
     def decide(entry_id: int, reason: str, base: list[dict]) -> Verdict | None:
@@ -595,8 +691,8 @@ def validate_finding(candidate: dict, existing: list[dict]) -> Verdict:
             user_message = _delta_message(candidate, new_entries)
             sent_ids = {e.get("id") for e in new_entries}
 
-        # Session mode: the model knows the full list from history, so one
-        # global judge turn covers everything - no batching needed.
+        # The judge decides against everything the session knows - a single
+        # turn, since the full list is already in the conversation.
         reading, answer = judge(base, user_message, set(by_id))
         _record_turn(session, key, user_message, answer, current, sent_ids)
         base = list(session.messages)

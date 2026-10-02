@@ -7,7 +7,14 @@ through a stubbed transport.
 import pytest
 
 import app.validator as validator
-from app.validator import _classify, _fingerprint, _near_duplicate_id, _read_answer
+from app.validator import (
+    _classify,
+    _fingerprint,
+    _links,
+    _near_duplicate_id,
+    _read_answer,
+    _tokens,
+)
 
 BATCH_IDS = {1}
 
@@ -110,6 +117,46 @@ def test_different_text_is_not_near_duplicate():
     assert _near_duplicate_id(candidate, existing) is None
 
 
+def test_compounds_stay_whole_and_stopwords_drop():
+    tokens = _tokens("we should look for the file flag-12345.txt on the server")
+    assert "flag-12345.txt" in tokens
+    assert "we" not in tokens
+    assert "the" not in tokens
+    assert "server" in tokens
+
+
+def test_reason_mentioning_shared_token_trips_recheck():
+    # the exact VPS failure: null/null, but the prose names the shared secret
+    candidate = {"title": "c", "content": "another finding about flag-12345.txt today"}
+    existing = [
+        {"id": 1, "type": "finding", "title": "t", "content": "look for flag-12345.txt"}
+    ]
+    links = _links(candidate, existing)
+    assert links and links[0][1] == 1
+    reading = _read_answer(
+        '{"closest": null, "duplicate_of": null, "reason": "the candidate is a '
+        'new finding about the same thing as the existing finding about the '
+        'file flag-12345.txt"}',
+        {1},
+        links,
+    )
+    assert (reading.kind, reading.entry_id) == ("unclear", 1)
+
+
+def test_reason_without_shared_token_stays_clean():
+    candidate = {"title": "c", "content": "recovered backup-2024.zip from /var/www yesterday"}
+    existing = [
+        {"id": 1, "type": "finding", "title": "t", "content": "look for flag-12345.txt"}
+    ]
+    links = _links(candidate, existing)
+    reading = _read_answer(
+        '{"closest": null, "duplicate_of": null, "reason": "a different file"}',
+        {1},
+        links,
+    )
+    assert reading.kind == "clean"
+
+
 def _entry(eid, text):
     return {"id": eid, "type": "finding", "title": f"t{eid}", "content": text}
 
@@ -189,9 +236,31 @@ def test_edited_finding_resets_session(stub):
 
 
 def test_unclear_answer_is_resolved_by_recheck(stub):
+    # the judge hedges (valid closest, null duplicate_of): the pair gets the
+    # yes/no re-check instead of being guessed at or accepted.
     existing = [_entry(1, "look for the file flag-12345.txt on the server")]
     stub.answers = [
         '{"closest": 1, "duplicate_of": null, "reason": "both are about flag-12345.txt"}',
+        '{"same": true, "reason": "the find completes the look"}',
+    ]
+    verdict = validator.validate_finding(
+        {
+            "title": "c",
+            "content": "something with no shared tokens at all, just prose here",
+            "challenge_id": "chall-x",
+        },
+        existing,
+    )
+    assert verdict.ok is False
+    assert verdict.duplicate_of == 1
+    assert len(stub.calls) == 2  # judge + yes/no re-check
+
+
+def test_judge_duplicate_is_confirmed(stub):
+    # the judge names finding #1 first; the re-check confirms it.
+    existing = [_entry(1, "we should look for the file flag-12345.txt on the server")]
+    stub.answers = [
+        '{"closest": 1, "duplicate_of": 1, "reason": "both are about flag-12345.txt"}',
         '{"same": true, "reason": "the find completes the look"}',
     ]
     verdict = validator.validate_finding(
@@ -205,3 +274,20 @@ def test_unclear_answer_is_resolved_by_recheck(stub):
     assert verdict.ok is False
     assert verdict.duplicate_of == 1
     assert len(stub.calls) == 2  # judge + yes/no re-check
+
+
+def test_judge_clean_accepts_without_recheck(stub):
+    existing = [_entry(1, "we should look for the file flag-12345.txt on the server")]
+    stub.answers = [
+        '{"closest": null, "duplicate_of": null, "reason": "unrelated new area"}'
+    ]
+    verdict = validator.validate_finding(
+        {
+            "title": "c",
+            "content": "brand new technique never seen",
+            "challenge_id": "chall-x",
+        },
+        existing,
+    )
+    assert verdict.ok is True
+    assert len(stub.calls) == 1  # judge only

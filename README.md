@@ -193,9 +193,10 @@ Scope and comparison set:
   an unverified note said something similar would throw the knowledge away.
 - Near-identical text (similarity ≥ 0.9) is rejected outright with no model
   call, so plain re-posts are caught even when the model is unusable.
-- The rest is judged in one turn against everything the session knows; a
-  rejection only ever happens through the re-check below. (Batching survives
-  only in the oversized stateless fallback.)
+- The judge decides in one turn against everything the session knows. A
+  hedged or contradictory answer, or a clean answer whose prose still mentions
+  a shared distinctive token, goes to the same yes/no re-check. (Batching
+  survives only in the oversized stateless fallback.)
 
 How small-model confusion is handled, since those are the models actually used:
 
