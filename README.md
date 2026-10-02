@@ -178,27 +178,29 @@ Scope and comparison set:
 - Only **confirmed findings** are in the comparison set. An `unconfirmed` note
   or a `dead_end` is not a duplicate of a finding — rejecting a finding because
   an unverified note said something similar would throw the knowledge away.
-- Findings are compared in batches; if any batch reports a duplicate the
-  candidate is rejected.
+- Near-identical text (similarity ≥ 0.9) is rejected outright with no model
+  call, so plain re-posts are caught even when the model is unusable.
+- The rest is judged in batches; a batch only ever rejects through the re-check
+  below.
 
-Two details matter for small models, which are the ones actually used here:
+How small-model confusion is handled, since those are the models actually used:
 
-- **The model is never asked for a boolean.** It answers `{"duplicate_of": <id
-  or null>, "reason": "..."}` and `ok` is derived in code. A small model will
-  otherwise answer `"ok": true` while its reason says the candidate is the same
-  knowledge as an existing finding. An answer also counts as a duplicate when
-  the reason names a finding (`#7`) even if `duplicate_of` is missing or wrong.
-- **The answer is forced to be usable.** The schema above is sent to Ollama as
-  structured output (`format: <schema>`) with thinking switched off, because a
-  thinking model asked for plain JSON answers `{}` — no judgement at all. If
-  the Ollama server or the model rejects structured output or `think: false`
-  (HTTP 400), the validator steps down: schema without `think`, then plain
-  `format: json`, and remembers where it landed. An answer that still carries no
-  judgement is treated as a validator failure, not as "new knowledge".
-- **A rejection is re-checked.** Before an entry is dropped, the model is asked
-  again about that one pair (candidate vs. the single finding it duplicates).
-  Only if it agrees a second time is the entry rejected, so a small model cannot
-  quietly delete new knowledge (`HUB_VALIDATE_CONFIRM=0` to switch off).
+- **The verdict never comes from a boolean or from prose.** The judge answers
+  `{"duplicate_of": <id or null>, "reason": "..."}` and only a valid id counts
+  as a duplicate. A small model will otherwise answer `"ok": true` while its
+  reason says the candidate is the same knowledge as an existing finding.
+- **Contradictions go to a yes/no re-check, not to a guess.** If the answer
+  points at a real finding but gives no usable id (contradictory flags, a vague
+  duplicate claim), that one pair is re-asked with a short question —
+  `{"same": true/false, "reason": "..."}` — and its answer decides. Nothing is
+  ever attributed to a finding the model did not name.
+- **References must be written `[#7]`.** Only bracketed references count, so a
+  port `#8080` or an issue `#12` in a reason can never flip a verdict.
+- **The answer is forced to be usable.** The schema is sent to Ollama as
+  structured output with thinking switched off, because a thinking model asked
+  for plain JSON answers `{}`. On HTTP 400 the request steps down (schema
+  without `think`, then plain `format: json`) and remembers where it landed. An
+  answer that still carries no judgement is a validator failure, not a verdict.
 
 A rejection returns `422` and nothing is persisted:
 

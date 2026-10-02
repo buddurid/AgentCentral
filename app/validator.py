@@ -7,44 +7,61 @@ variable names, endpoint, offset or payload differ. The comparison is semantic
 challenge.
 
 Only confirmed findings are used as the comparison set. An `unconfirmed` note
-or a `dead_end` is not a duplicate of a finding: the finding still adds
-something, and suppressing it would throw the knowledge away.
+or a `dead_end` is not a duplicate of a finding: rejecting a finding because an
+unverified note said something similar would throw the knowledge away.
 
-Configuration (environment variables, read at call time):
+How a candidate is decided (in order):
+
+1. Near-identical text (normalized similarity >= 0.9) to an existing finding
+   is rejected outright, with no model call.
+2. The model judges each batch of findings and answers
+   {"duplicate_of": <id or null>, "reason": "..."}.
+   - A valid id means a duplicate; the entry it names is re-checked with a
+     short yes/no question before the candidate is dropped.
+   - A contradictory or vague answer (e.g. "ok": true while the reason names a
+     finding, or a duplicate claim without a usable id) is *not* trusted. The
+     named entry is re-checked with the same short yes/no question, and its
+     answer decides.
+   - A clear "nothing known yet" means the batch is clean.
+3. Only a confirmed duplicate rejects the candidate.
+
+Small models contradict themselves, so the verdict is never taken from a
+boolean or from prose alone: a rejection always names a real finding id, and
+the yes/no re-check confirms that one pair.
+
+Configuration (environment variables, read per call):
 
     HUB_VALIDATE=0            disable validation entirely (default: enabled)
     HUB_OLLAMA_URL=...        Ollama base URL (default http://localhost:11434)
     HUB_OLLAMA_MODEL=...      model name (default llama3.1)
     HUB_OLLAMA_TIMEOUT=30     request timeout in seconds
-    HUB_VALIDATE_BATCH=25     existing findings per model call
-    HUB_VALIDATE_CONFIRM=1    re-check a rejection before dropping it
+    HUB_VALIDATE_BATCH=25     existing findings per judge call
+    HUB_VALIDATE_CONFIRM=1    re-check a duplicate before dropping it
     HUB_VALIDATE_MAX_CHARS=2000   max characters kept per entry
     HUB_VALIDATE_DEBUG=0      print every model answer
 
-Existing findings are compared in batches; if any batch reports a duplicate the
-candidate is rejected. If Ollama is unreachable, errors, or answers with unusable
-output the candidate is accepted (fail-open) so the hub keeps working.
+The judge schema is sent as Ollama structured output with thinking switched
+off. On HTTP 400 the request steps down (schema+no-think, schema, plain json)
+and remembers where it landed. An unusable answer is a validator failure, not
+a verdict: the candidate is accepted (fail-open) so the hub keeps working.
 Validation never raises.
 """
 
+import difflib
 import json
 import os
 import re
 from dataclasses import dataclass
+from typing import Any
 
 import httpx
 
-OLLAMA_URL = os.environ.get("HUB_OLLAMA_URL", "http://localhost:11434").rstrip("/")
-OLLAMA_MODEL = os.environ.get("HUB_OLLAMA_MODEL", "llama3.1")
-
 DEFAULT_BATCH = 25
 DEFAULT_MAX_CHARS = 2000
+NEAR_DUP_RATIO = 0.9
+NEAR_DUP_MIN_CHARS = 60
 
-# The model is not asked for a boolean, only for the id of the finding that
-# already covers the candidate. The schema is sent to Ollama as structured
-# output, so the two keys cannot go missing (a thinking model asked for plain
-# JSON happily answers "{}").
-OUTPUT_SCHEMA = {
+JUDGE_SCHEMA = {
     "type": "object",
     "properties": {
         "duplicate_of": {"type": ["integer", "null"]},
@@ -53,24 +70,19 @@ OUTPUT_SCHEMA = {
     "required": ["duplicate_of", "reason"],
 }
 
-# Preferred first: structured output and no thinking. Ollama answers 400 when the
-# server or the model does not support one of them, so we step down until one
-# works and remember where we landed.
-MODES = (
-    {"format": OUTPUT_SCHEMA, "think": False},
-    {"format": OUTPUT_SCHEMA},
-    {"format": "json"},
-)
-_mode_index: int | None = None
-
-
-class _Unsupported(Exception):
-    """Ollama rejected the request shape (HTTP 400): try the next mode."""
+CONFIRM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "same": {"type": "boolean"},
+        "reason": {"type": "string"},
+    },
+    "required": ["same", "reason"],
+}
 
 SYSTEM_PROMPT = (
     "You decide whether a new CTF finding is already known to the team.\n\n"
-    "You get a CANDIDATE finding and EXISTING findings from the same challenge, "
-    "each labelled with its id like [#7].\n\n"
+    "You get a CANDIDATE finding and EXISTING findings from the same challenge. "
+    "Each existing finding is labelled with its id like [#7].\n\n"
     "The candidate IS a duplicate when it states the same result as an existing "
     "finding: the same conclusion, the same observation, the same primitive, or "
     "the same link in an exploit chain. That is still true when the wording, "
@@ -85,11 +97,9 @@ SYSTEM_PROMPT = (
     "Answer with ONLY a JSON object with these two keys and nothing else:\n"
     '{"duplicate_of": <id of the existing finding that already covers it, or '
     'null>, "reason": "<one short sentence>"}\n\n'
-    "The two rules that matter most:\n"
-    "1. If your reason says the candidate covers the same knowledge as some "
-    "existing finding, duplicate_of MUST be that finding's id. Never null then.\n"
-    "2. duplicate_of MUST be null only when the candidate adds knowledge that no "
-    "existing finding states.\n\n"
+    "Write an existing finding's reference exactly like [#7], including the "
+    "brackets. If no existing finding states the candidate's result, "
+    "duplicate_of MUST be null and the reason MUST say what is new.\n\n"
     "Example - duplicate:\n"
     'Existing finding [#4]: "the libc base can be read from the buffer returned '
     'by GET /api/export".\n'
@@ -106,6 +116,17 @@ SYSTEM_PROMPT = (
     'working one_gadget offset"}'
 )
 
+CONFIRM_PROMPT = (
+    "You decide whether two CTF notes state the same result.\n\n"
+    "NOTE A is already in the team's notebook. NOTE B is proposed as a new "
+    "finding. B is the same result as A only if it states the same conclusion, "
+    "observation, primitive or exploit-chain link - even if worded differently "
+    "or with different names, endpoints or payloads. If B adds anything A does "
+    "not state, it is not the same.\n\n"
+    'Answer with ONLY a JSON object: {"same": true, "reason": "<what both '
+    'state>"} or {"same": false, "reason": "<what B adds>"}.'
+)
+
 
 @dataclass
 class Verdict:
@@ -115,17 +136,30 @@ class Verdict:
     duplicate_of: int | None = None
 
 
-def _enabled() -> bool:
-    return _enabled_env("HUB_VALIDATE")
+@dataclass
+class _Reading:
+    """What the judge's answer means: a definite reject, a clean accept, or an
+    entry id that needs the yes/no re-check to decide ("unclear")."""
+
+    kind: str  # "duplicate" | "clean" | "unclear"
+    entry_id: int | None
+    reason: str
 
 
-def _enabled_env(name: str) -> bool:
-    return os.environ.get(name, "1").strip().lower() not in (
+_chat_state: dict[str, Any] = {"url": None, "model": None, "index": None}
+
+
+def _flag(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).strip().lower() not in (
         "0",
         "false",
         "no",
         "off",
     )
+
+
+def _debug() -> bool:
+    return _flag("HUB_VALIDATE_DEBUG", "0")
 
 
 def _int_env(name: str, default: int) -> int:
@@ -135,23 +169,45 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _ollama_url() -> str:
+    return os.environ.get("HUB_OLLAMA_URL", "http://localhost:11434").rstrip("/")
+
+
+def _ollama_model() -> str:
+    return os.environ.get("HUB_OLLAMA_MODEL", "llama3.1")
+
+
 def _timeout() -> float:
     return float(os.environ.get("HUB_OLLAMA_TIMEOUT", "30"))
-
-
-def _debug() -> bool:
-    return os.environ.get("HUB_VALIDATE_DEBUG", "0").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
 
 
 def _clip(text: str | None) -> str:
     limit = _int_env("HUB_VALIDATE_MAX_CHARS", DEFAULT_MAX_CHARS)
     text = (text or "").strip()
     return text if len(text) <= limit else text[:limit] + " [...]"
+
+
+def _normalize(text: str | None) -> str:
+    return re.sub(r"\s+", " ", (text or "").lower()).strip()
+
+
+def _near_duplicate_id(candidate: dict, findings: list[dict]) -> int | None:
+    """Id of a finding whose normalized text is nearly identical, else None.
+
+    Deterministic net for re-posts: works even when the model is unusable.
+    The threshold is deliberately high - this only fires on copies, the model
+    handles everything semantic.
+    """
+    text = _normalize(f"{candidate.get('title', '')}\n{candidate.get('content', '')}")
+    if len(text) < NEAR_DUP_MIN_CHARS:
+        return None
+    for entry in findings:
+        other = _normalize(f"{entry.get('title', '')}\n{entry.get('content', '')}")
+        if len(other) < NEAR_DUP_MIN_CHARS:
+            continue
+        if difflib.SequenceMatcher(None, text, other).ratio() >= NEAR_DUP_RATIO:
+            return entry.get("id")
+    return None
 
 
 def _findings_only(existing: list[dict]) -> list[dict]:
@@ -181,25 +237,44 @@ def _user_message(candidate: dict, batch: list[dict]) -> str:
     )
 
 
-def _chat(messages: list[dict]) -> dict:
-    """POST to /api/chat, stepping down through MODES on an unsupported request.
+def _pair_message(candidate: dict, entry: dict) -> str:
+    return (
+        "NOTE A (already in the notebook)\n"
+        f"title: {entry.get('title', '')}\n"
+        f"content: {_clip(entry.get('content'))}\n\n"
+        "NOTE B (proposed finding)\n"
+        f"title: {candidate.get('title', '')}\n"
+        f"content: {_clip(candidate.get('content'))}"
+    )
 
-    Raises _Unsupported if no mode works; other errors (unreachable, timeout,
-    non-400 failure) propagate so the caller can fail open.
+
+def _chat(messages: list[dict], schema: dict) -> dict:
+    """POST to /api/chat, stepping down on an unsupported request shape.
+
+    Tries structured output without thinking, then structured output, then
+    plain JSON. Remembers the working mode per endpoint+model. Raises on any
+    failure (including all modes rejected) so the caller can fail open.
     """
-    global _mode_index
-    start = _mode_index or 0
-    for index in range(start, len(MODES)):
-        mode = MODES[index]
+    url, model = _ollama_url(), _ollama_model()
+    if _chat_state["url"] == url and _chat_state["model"] == model:
+        start = _chat_state["index"] or 0
+    else:
+        start = 0
+    modes = (
+        {"format": schema, "think": False},
+        {"format": schema},
+        {"format": "json"},
+    )
+    for index in range(start, len(modes)):
         with httpx.Client(timeout=_timeout()) as client:
             response = client.post(
-                f"{OLLAMA_URL}/api/chat",
+                f"{url}/api/chat",
                 json={
-                    "model": OLLAMA_MODEL,
+                    "model": model,
                     "stream": False,
                     "options": {"temperature": 0},
                     "messages": messages,
-                    **mode,
+                    **modes[index],
                 },
             )
         if response.status_code == 400:
@@ -207,127 +282,150 @@ def _chat(messages: list[dict]) -> dict:
                 print(f"[validator] mode {index} rejected: {response.text[:200]}")
             continue
         response.raise_for_status()
-        _mode_index = index
+        _chat_state.update({"url": url, "model": model, "index": index})
         return response.json()
-    raise _Unsupported("no supported request mode")
+    raise ValueError("ollama rejected every request mode")
 
 
-def _ask_model(candidate: dict, batch: list[dict]) -> Verdict:
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": _user_message(candidate, batch)},
-    ]
-    raw = _chat(messages)
-    if _debug():
-        print(f"[validator] {_mode_index} {raw}")
-    return _parse(raw["message"]["content"], batch)
-
-
-def _parse(content: str, batch: list[dict]) -> Verdict:
-    """Turn the model's answer into a Verdict.
-
-    A small model cannot be trusted with a boolean: it will happily answer
-    "ok": true while the reason says the candidate is the same knowledge as an
-    existing finding. So the answer is only treated as a duplicate when it names
-    the finding that already covers it - either in `duplicate_of`, or as a "#id"
-    reference inside the reason, or by an explicit false/true duplicate flag.
-    """
+def _decode(content: str) -> dict:
     try:
         data = json.loads(content)
     except (TypeError, ValueError):
         raise ValueError("model did not answer with JSON")
     if not isinstance(data, dict):
         raise ValueError("model answer was not a JSON object")
+    return data
 
+
+def _read_answer(content: str, known_ids: set) -> _Reading:
+    """Decide what the judge's answer means. Raises ValueError when the answer
+    carries no judgement at all (not a verdict - a validator failure)."""
+    data = _decode(content)
     reason = str(data.get("reason", "") or "")
 
-    known_ids = {e.get("id") for e in batch}
-    mentioned = [int(n) for n in re.findall(r"#(\d+)", reason)]
+    named = [int(n) for n in re.findall(r"\[#(\d+)\]", reason)]
+    named = [n for n in named if n in known_ids]
 
     duplicate_of = data.get("duplicate_of")
     if isinstance(duplicate_of, bool) or not isinstance(duplicate_of, int):
         duplicate_of = None
-    if duplicate_of not in known_ids:
-        # the id was left out, or invented: fall back to one named in the reason
-        duplicate_of = next((m for m in mentioned if m in known_ids), None)
+    if duplicate_of is not None and duplicate_of not in known_ids:
+        # an id from nowhere cannot be checked against anything
+        duplicate_of = None
 
-    says_duplicate = (
-        duplicate_of is not None
-        or data.get("duplicate") is True
+    claims_duplicate = (
+        data.get("duplicate") is True
         or data.get("is_duplicate") is True
         or data.get("ok") is False
-        or bool(mentioned)
     )
-    if says_duplicate and duplicate_of is None:
-        # a duplicate of the batch, but it did not say which one
-        duplicate_of = batch[0].get("id")
 
-    if not says_duplicate and not reason.strip():
-        # "{}" or an empty object carries no judgement at all: treating that as
-        # "new knowledge" would let duplicates through, so it is an error
+    if duplicate_of is not None:
+        if not reason.strip():
+            raise ValueError("model named a finding but gave no reason")
+        return _Reading("duplicate", duplicate_of, reason)
+
+    if named:
+        # the model points at a real finding but gives no usable id:
+        # contradictory ("ok": true + "same as [#1]") or vague
+        # ("duplicate": true, no id). Never guess - re-check that pair.
+        return _Reading("unclear", named[0], reason or "model pointed at a finding")
+
+    if claims_duplicate:
+        # a duplicate claim with no finding attached cannot be checked
+        raise ValueError("model claimed a duplicate without naming a finding")
+
+    if not reason.strip():
         raise ValueError("model answer carried no judgement")
-
-    return Verdict(
-        ok=not says_duplicate,
-        category="duplicate" if says_duplicate else None,
-        reason=reason,
-        duplicate_of=duplicate_of if says_duplicate else None,
-    )
+    return _Reading("clean", None, reason)
 
 
-def _confirm_duplicate(candidate: dict, entry: dict) -> bool:
-    """Second opinion on one candidate/finding pair before dropping it.
+def _ask_judge(candidate: dict, batch: list[dict]) -> _Reading:
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": _user_message(candidate, batch)},
+    ]
+    raw = _chat(messages, JUDGE_SCHEMA)
+    if _debug():
+        print(f"[validator] {_chat_state['index']} {raw}")
+    known_ids = {e.get("id") for e in batch}
+    return _read_answer(raw["message"]["content"], known_ids)
 
-    Small models jump at "same" as well. A rejection only counts when a second,
-    narrower pass - the candidate against that single finding - agrees. Any
-    failure to get an answer counts as "not a duplicate" so real knowledge is
-    never lost to a flaky model.
-    """
+
+def _ask_confirm(candidate: dict, entry: dict) -> bool | None:
+    """Yes/no re-check of one pair. True = same result, False = new knowledge,
+    None = no answer (caller fails open)."""
     try:
-        return _ask_model(candidate, [entry]).duplicate_of is not None
-    except Exception:  # noqa: BLE001 - fail open, keep the entry
-        return False
+        messages = [
+            {"role": "system", "content": CONFIRM_PROMPT},
+            {"role": "user", "content": _pair_message(candidate, entry)},
+        ]
+        raw = _chat(messages, CONFIRM_SCHEMA)
+        if _debug():
+            print(f"[validator] confirm {_chat_state['index']} {raw}")
+        data = _decode(raw["message"]["content"])
+        same = data.get("same")
+        if not isinstance(same, bool):
+            if isinstance(data.get("ok"), bool):
+                same = not data["ok"]
+            elif isinstance(data.get("duplicate"), bool):
+                same = data["duplicate"]
+            elif isinstance(data.get("is_duplicate"), bool):
+                same = data["is_duplicate"]
+            else:
+                return None
+        return same
+    except Exception:  # noqa: BLE001 - no answer is not a rejection
+        return None
 
 
 def validate_finding(candidate: dict, existing: list[dict]) -> Verdict:
     """Return a Verdict for a candidate `finding`. Never raises."""
-    if not _enabled():
+    if not _flag("HUB_VALIDATE"):
         return Verdict(ok=True, reason="validation disabled")
 
     findings = _findings_only(existing)
     if not findings:
         return Verdict(ok=True, reason="no existing finding to duplicate")
 
+    by_id = {e.get("id"): e for e in findings}
+    near = _near_duplicate_id(candidate, findings)
+    if near is not None:
+        entry = by_id[near]
+        return Verdict(
+            ok=False,
+            category="duplicate",
+            reason=f"near-identical text to existing finding #{near}: {entry.get('title', '')}",
+            duplicate_of=near,
+        )
+
+    confirm = _flag("HUB_VALIDATE_CONFIRM")
     size = max(1, _int_env("HUB_VALIDATE_BATCH", DEFAULT_BATCH))
-    double_check = _enabled_env("HUB_VALIDATE_CONFIRM")
     compared = 0
     for start in range(0, len(findings), size):
         batch = findings[start : start + size]
         try:
-            verdict = _ask_model(candidate, batch)
+            reading = _ask_judge(candidate, batch)
         except Exception as exc:  # noqa: BLE001 - never break the hub
-            return Verdict(
-                ok=True,
-                reason=f"validator unavailable, accepted: {exc}",
-            )
+            return Verdict(ok=True, reason=f"validator unavailable, accepted: {exc}")
         compared += len(batch)
-        if verdict.ok:
+
+        if reading.kind == "clean":
             continue
 
-        match = next(
-            (e for e in batch if e.get("id") == verdict.duplicate_of), None
-        )
-        if double_check and (match is None or not _confirm_duplicate(candidate, match)):
-            if _debug():
-                print(f"[validator] not a duplicate after re-check: {verdict.reason}")
+        entry = by_id.get(reading.entry_id)
+        if entry is None:  # cannot happen, but never drop on confusion
             continue
-
+        if confirm:
+            same = _ask_confirm(candidate, entry)
+            if same is not True:
+                if _debug():
+                    print(f"[validator] re-check disagreed: {reading.reason}")
+                continue
         return Verdict(
             ok=False,
             category="duplicate",
-            reason=verdict.reason
-            or f"same knowledge as existing finding #{verdict.duplicate_of}",
-            duplicate_of=verdict.duplicate_of,
+            reason=reading.reason or f"same knowledge as existing finding #{reading.entry_id}",
+            duplicate_of=reading.entry_id,
         )
 
     return Verdict(
