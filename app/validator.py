@@ -17,7 +17,9 @@ Configuration (environment variables, read at call time):
     HUB_OLLAMA_MODEL=...      model name (default llama3.1)
     HUB_OLLAMA_TIMEOUT=30     request timeout in seconds
     HUB_VALIDATE_BATCH=25     existing findings per model call
+    HUB_VALIDATE_CONFIRM=1    re-check a rejection before dropping it
     HUB_VALIDATE_MAX_CHARS=2000   max characters kept per entry
+    HUB_VALIDATE_DEBUG=0      print every model answer
 
 Existing findings are compared in batches; if any batch reports a duplicate the
 candidate is rejected. If Ollama is unreachable, errors, or answers with unusable
@@ -37,6 +39,33 @@ OLLAMA_MODEL = os.environ.get("HUB_OLLAMA_MODEL", "llama3.1")
 
 DEFAULT_BATCH = 25
 DEFAULT_MAX_CHARS = 2000
+
+# The model is not asked for a boolean, only for the id of the finding that
+# already covers the candidate. The schema is sent to Ollama as structured
+# output, so the two keys cannot go missing (a thinking model asked for plain
+# JSON happily answers "{}").
+OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "duplicate_of": {"type": ["integer", "null"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["duplicate_of", "reason"],
+}
+
+# Preferred first: structured output and no thinking. Ollama answers 400 when the
+# server or the model does not support one of them, so we step down until one
+# works and remember where we landed.
+MODES = (
+    {"format": OUTPUT_SCHEMA, "think": False},
+    {"format": OUTPUT_SCHEMA},
+    {"format": "json"},
+)
+_mode_index: int | None = None
+
+
+class _Unsupported(Exception):
+    """Ollama rejected the request shape (HTTP 400): try the next mode."""
 
 SYSTEM_PROMPT = (
     "You decide whether a new CTF finding is already known to the team.\n\n"
@@ -152,25 +181,45 @@ def _user_message(candidate: dict, batch: list[dict]) -> str:
     )
 
 
-def _ask_model(candidate: dict, batch: list[dict]) -> Verdict:
-    with httpx.Client(timeout=_timeout()) as client:
-        response = client.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={
-                "model": OLLAMA_MODEL,
-                "stream": False,
-                "format": "json",
-                "options": {"temperature": 0},
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": _user_message(candidate, batch)},
-                ],
-            },
-        )
+def _chat(messages: list[dict]) -> dict:
+    """POST to /api/chat, stepping down through MODES on an unsupported request.
+
+    Raises _Unsupported if no mode works; other errors (unreachable, timeout,
+    non-400 failure) propagate so the caller can fail open.
+    """
+    global _mode_index
+    start = _mode_index or 0
+    for index in range(start, len(MODES)):
+        mode = MODES[index]
+        with httpx.Client(timeout=_timeout()) as client:
+            response = client.post(
+                f"{OLLAMA_URL}/api/chat",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "stream": False,
+                    "options": {"temperature": 0},
+                    "messages": messages,
+                    **mode,
+                },
+            )
+        if response.status_code == 400:
+            if _debug():
+                print(f"[validator] mode {index} rejected: {response.text[:200]}")
+            continue
         response.raise_for_status()
-        raw = response.json()
+        _mode_index = index
+        return response.json()
+    raise _Unsupported("no supported request mode")
+
+
+def _ask_model(candidate: dict, batch: list[dict]) -> Verdict:
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": _user_message(candidate, batch)},
+    ]
+    raw = _chat(messages)
     if _debug():
-        print(f"[validator] {raw}")
+        print(f"[validator] {_mode_index} {raw}")
     return _parse(raw["message"]["content"], batch)
 
 
@@ -212,6 +261,11 @@ def _parse(content: str, batch: list[dict]) -> Verdict:
     if says_duplicate and duplicate_of is None:
         # a duplicate of the batch, but it did not say which one
         duplicate_of = batch[0].get("id")
+
+    if not says_duplicate and not reason.strip():
+        # "{}" or an empty object carries no judgement at all: treating that as
+        # "new knowledge" would let duplicates through, so it is an error
+        raise ValueError("model answer carried no judgement")
 
     return Verdict(
         ok=not says_duplicate,

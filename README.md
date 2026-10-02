@@ -188,6 +188,13 @@ Two details matter for small models, which are the ones actually used here:
   otherwise answer `"ok": true` while its reason says the candidate is the same
   knowledge as an existing finding. An answer also counts as a duplicate when
   the reason names a finding (`#7`) even if `duplicate_of` is missing or wrong.
+- **The answer is forced to be usable.** The schema above is sent to Ollama as
+  structured output (`format: <schema>`) with thinking switched off, because a
+  thinking model asked for plain JSON answers `{}` — no judgement at all. If
+  the Ollama server or the model rejects structured output or `think: false`
+  (HTTP 400), the validator steps down: schema without `think`, then plain
+  `format: json`, and remembers where it landed. An answer that still carries no
+  judgement is treated as a validator failure, not as "new knowledge".
 - **A rejection is re-checked.** Before an entry is dropped, the model is asked
   again about that one pair (candidate vs. the single finding it duplicates).
   Only if it agrees a second time is the entry rejected, so a small model cannot
