@@ -140,6 +140,7 @@ def _ask_model(candidate: dict, batch: list[dict]) -> Verdict:
             },
         )
         response.raise_for_status()
+        print(response.json())  # debug
         data = json.loads(response.json()["message"]["content"])
     duplicate_of = data.get("duplicate_of")
     return Verdict(
