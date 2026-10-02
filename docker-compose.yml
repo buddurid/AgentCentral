@@ -1,0 +1,98 @@
+services:
+  # ---------------------------------------------------------------- hub app
+  hub:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ctfhub:latest
+    container_name: ctfhub
+    restart: unless-stopped
+    ports:
+      - "${HUB_PORT:-8000}:8000"
+    environment:
+      HUB_HOST: 0.0.0.0
+      HUB_PORT: "8000"
+      HUB_DATA_DIR: /data
+      # reaches the ollama container over the compose network
+      HUB_OLLAMA_URL: http://ollama:11434
+      HUB_OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:4b}
+      # one request = model load + prompt eval + generation; CPU-only hosts
+      # are slow, so this is generous
+      HUB_OLLAMA_TIMEOUT: ${HUB_OLLAMA_TIMEOUT:-180}
+      HUB_VALIDATE: ${HUB_VALIDATE:-1}
+      HUB_VALIDATE_CONFIRM: ${HUB_VALIDATE_CONFIRM:-1}
+      HUB_VALIDATE_DEBUG: ${HUB_VALIDATE_DEBUG:-0}
+      HUB_VALIDATE_HISTORY: ${HUB_VALIDATE_HISTORY:-16000}
+      HUB_OLLAMA_CTX: ${HUB_OLLAMA_CTX:-8192}
+    volumes:
+      - hub_data:/data
+    depends_on:
+      model:
+        condition: service_completed_successfully
+    networks:
+      - hubnet
+
+  # ----------------------------------------------------------- ollama server
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ctfhub-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    # keep the model resident so validation isn't re-paying load time
+    environment:
+      OLLAMA_KEEP_ALIVE: 24h
+      OLLAMA_HOST: 0.0.0.0:11434
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    # 11434 stays internal to the compose network. Uncomment to also reach
+    # it from the host:
+    # ports:
+    #   - "11434:11434"
+    networks:
+      - hubnet
+
+    # NVIDIA GPU (requires the nvidia container toolkit). Uncomment:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # ------------------------------------------------------- one-shot: pull model
+  model:
+    image: ollama/ollama:latest
+    container_name: ctfhub-model-pull
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:4b}
+    command:
+      - |
+        set -e
+        echo "waiting for ollama..."
+        until ollama list >/dev/null 2>&1; do sleep 2; done
+        echo "pulling $${OLLAMA_MODEL}"
+        ollama pull "$${OLLAMA_MODEL}"
+        ollama show "$${OLLAMA_MODEL}"
+        echo "model ready"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - hubnet
+
+volumes:
+  hub_data:
+  ollama_models:
+
+networks:
+  hubnet:
+    driver: bridge
