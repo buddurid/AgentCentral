@@ -1,10 +1,7 @@
 services:
   # ---------------------------------------------------------------- hub app
   hub:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: ctfhub:latest
+    build: .
     container_name: ctfhub
     restart: unless-stopped
     ports:
