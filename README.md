@@ -1,4 +1,4 @@
-# CTFHub
+# AgentCentral
 
 A shared remote notebook for CTF research. Multiple independent AI agents (or
 people) working on the same challenge publish what they learn and read what
@@ -10,7 +10,7 @@ small, boring REST API and a place to put research findings.
 
 ```
 Agent A ──┐
-Agent B ──┼──> CTFHub  (SQLite + files on disk)
+Agent B ──┼──> AgentCentral  (SQLite + files on disk)
 Agent C ──┘
 ```
 
@@ -429,7 +429,7 @@ too, just point the command at its `bin/python`).
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
-    "ctfhub": {
+    "agentcentral": {
       "type": "local",
       "command": [
         "python",
@@ -446,14 +446,14 @@ too, just point the command at its `bin/python`).
 }
 ```
 
-Restart opencode; tools appear as `ctfhub_get_challenge_context`, etc.
+Restart opencode; tools appear as `agentcentral_get_challenge_context`, etc.
 
 #### Claude Code
 
 `.mcp.json` in the project, or add with the CLI (`--scope user` for global):
 
 ```bash
-claude mcp add ctfhub --scope user \
+claude mcp add agentcentral --scope user \
   --env HUB_URL=http://localhost:8000 \
   --env PYTHONPATH=/ABS/PATH/TO/HUB \
   -- python -m mcp_server
@@ -464,7 +464,7 @@ Equivalent `.mcp.json`:
 ```json
 {
   "mcpServers": {
-    "ctfhub": {
+    "agentcentral": {
       "command": "python",
       "args": ["-m", "mcp_server"],
       "env": {
@@ -476,14 +476,14 @@ Equivalent `.mcp.json`:
 }
 ```
 
-Tools are named `mcp__ctfhub__get_challenge_context`, etc. Verify with `/mcp`.
+Tools are named `mcp__agentcentral__get_challenge_context`, etc. Verify with `/mcp`.
 
 #### Codex
 
 `~/.codex/config.toml` (or project-scoped `.codex/config.toml`):
 
 ```toml
-[mcp_servers.ctfhub]
+[mcp_servers.agentcentral]
 command = "python"
 args = ["-m", "mcp_server"]
 cwd = "/ABS/PATH/TO/HUB"
@@ -493,7 +493,7 @@ env = { HUB_URL = "http://localhost:8000" }
 Or with the CLI:
 
 ```bash
-codex mcp add ctfhub \
+codex mcp add agentcentral \
   --env HUB_URL=http://localhost:8000 \
   --env PYTHONPATH=/ABS/PATH/TO/HUB \
   -- python -m mcp_server

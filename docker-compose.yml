@@ -2,7 +2,7 @@ services:
   # ---------------------------------------------------------------- hub app
   hub:
     build: .
-    container_name: ctfhub
+    container_name: agentcentral
     restart: unless-stopped
     ports:
       - "${HUB_PORT:-8000}:8000"
@@ -32,7 +32,7 @@ services:
   # ----------------------------------------------------------- ollama server
   ollama:
     image: ollama/ollama:latest
-    container_name: ctfhub-ollama
+    container_name: agentcentral-ollama
     restart: unless-stopped
     volumes:
       - ollama_models:/root/.ollama
@@ -65,7 +65,7 @@ services:
   # ------------------------------------------------------- one-shot: pull model
   model:
     image: ollama/ollama:latest
-    container_name: ctfhub-model-pull
+    container_name: agentcentral-model-pull
     restart: "no"
     entrypoint: ["/bin/sh", "-c"]
     environment:
