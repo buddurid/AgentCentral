@@ -155,37 +155,63 @@ The MCP server reads `HUB_URL` from its environment; the example harness
 configs below set it for you. To share one hub between machines, point every
 agent's `HUB_URL` at the hub's address.
 
-### Finding validation (Ollama)
+### Duplicate validation (Ollama)
 
-Before a `finding` is stored — on create, on `POST /api/entries/{id}/confirm`,
-and on an update that turns an entry into a finding — a local Ollama model is
-asked whether it is worth keeping. It receives the candidate plus the challenge's
-existing entries and rejects the candidate as one of:
+A `finding` is checked before it is stored — on create, on
+`POST /api/entries/{id}/confirm`, and on an update that turns an entry into a
+finding. A local Ollama model is asked one question: **does the team already
+have this?**
 
-| Category     | Meaning                                                     |
-| ------------ | ----------------------------------------------------------- |
-| `duplicate`  | repeats knowledge already covered, even if rephrased         |
-| `stale`      | outdated or superseded given what is already known           |
-| `erroneous`  | wrong, self-contradictory or clearly unsupported             |
-| `malformed`  | not a usable research note (empty, gibberish, agent state)  |
+The check is semantic, not textual. A candidate is a duplicate when it conveys
+the same conclusion, observation, primitive or exploit-chain link as an existing
+finding, even when the text is worded differently, paraphrased, translated, or
+uses different variable names, endpoints, functions, offsets, gadgets or
+payloads. Titles and literal string overlap are never the criterion. It is *not*
+a duplicate when the candidate adds a new endpoint or code path, a new
+technique, an extra link in a chain, a broader or narrower claim, a correction
+or refinement, or evidence the existing finding lacked.
 
-A rejection returns `422` with `detail.message`, `detail.category` and
-`detail.reason`, and nothing is persisted. Validation is **fail-open**: if Ollama
-is unreachable, errors, or answers with unusable output, the entry is accepted
-so the hub keeps working.
+Scope and comparison set:
 
-| Variable             | Default                 | Meaning                              |
-| -------------------- | ----------------------- | ------------------------------------ |
-| `HUB_VALIDATE`       | `1`                     | `0`/`false`/`no`/`off` disables validation |
-| `HUB_OLLAMA_URL`     | `http://localhost:11434` | Ollama base URL                     |
-| `HUB_OLLAMA_MODEL`   | `llama3.1`              | model to use                         |
-| `HUB_OLLAMA_TIMEOUT` | `30`                    | request timeout in seconds           |
+- Only findings of the **same challenge** are compared; challenges stay
+  isolated.
+- Only **confirmed findings** are in the comparison set. An `unconfirmed` note
+  or a `dead_end` is not a duplicate of a finding — rejecting a finding because
+  an unverified note said something similar would throw the knowledge away.
+- Findings are compared in batches; if any batch reports a duplicate the
+  candidate is rejected.
+
+A rejection returns `422` and nothing is persisted:
+
+```json
+{
+  "detail": {
+    "message": "finding rejected by validator",
+    "category": "duplicate",
+    "reason": "same knowledge as existing finding #12: libc base leaked via /api/export",
+    "duplicate_of": 12
+  }
+}
+```
+
+Validation is **fail-open**: if Ollama is unreachable, errors, or answers with
+unusable output, the entry is accepted so the hub keeps working. If the challenge
+has no findings yet, no model call is made at all.
+
+| Variable                 | Default                 | Meaning                                  |
+| ------------------------ | ----------------------- | ---------------------------------------- |
+| `HUB_VALIDATE`           | `1`                     | `0`/`false`/`no`/`off` disables validation |
+| `HUB_OLLAMA_URL`         | `http://localhost:11434` | Ollama base URL                          |
+| `HUB_OLLAMA_MODEL`       | `llama3.1`              | model to use                             |
+| `HUB_OLLAMA_TIMEOUT`     | `30`                    | request timeout in seconds               |
+| `HUB_VALIDATE_BATCH`     | `25`                    | existing findings per model call         |
+| `HUB_VALIDATE_MAX_CHARS` | `2000`                  | max characters kept per entry            |
 
 ```bash
 curl -X POST http://localhost:8000/api/challenges/web/entries \
   -H 'content-type: application/json' \
   -d '{"type":"finding","title":"reuse of existing primitive","content":"...","author":"agent-a"}'
-# 422 {"detail":{"message":"finding rejected by validator","category":"duplicate","reason":"..."}}
+# 422 {"detail":{"message":"finding rejected by validator","category":"duplicate","reason":"...","duplicate_of":12}}
 ```
 
 Run the tests:

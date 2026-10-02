@@ -80,10 +80,13 @@ names below are the suffixes.
    what teammates need.
 
    `publish_finding` and `confirm_entry` are checked by the hub before they are
-   stored. A rejection means the finding was a duplicate, stale, erroneous or
-   malformed — the error names the category and why. Do not retry it verbatim:
-   either publish it as `unconfirmed` with the extra evidence that makes it
-   solid, or rework it into knowledge the team does not already have.
+   stored: a finding the team already has is rejected. The check compares
+   meaning, not wording, so a rephrasing, a different payload or a different
+   variable name for the same result is still a duplicate. On rejection the
+   error names the existing `duplicate_of` finding that already covers it. That
+   is not a failure of your work — do not retry it. If you genuinely have
+   something new that the existing finding does not contain, publish that
+   specific part, or publish it as `unconfirmed` until it is clear.
 
 5. **Keep the record honest.**
    - Verified an unconfirmed lead -> `confirm_entry(entry_id)` (becomes a

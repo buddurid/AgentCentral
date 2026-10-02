@@ -213,12 +213,12 @@ def test_confirm_rejected_by_validator(monkeypatch):
         main,
         "validate_finding",
         lambda candidate, existing: Verdict(
-            ok=False, category="erroneous", reason="unproven"
+            ok=False, category="duplicate", reason="same as #1"
         ),
     )
     res = client.post(f"/api/entries/{entry['id']}/confirm")
     assert res.status_code == 422
-    assert res.json()["detail"]["category"] == "erroneous"
+    assert res.json()["detail"]["category"] == "duplicate"
 
     # still unconfirmed, not promoted
     body = client.get(f"/api/challenges/{cid}/entries/{entry['id']}").json()
@@ -236,7 +236,7 @@ def test_update_into_finding_is_validated(monkeypatch):
         main,
         "validate_finding",
         lambda candidate, existing: Verdict(
-            ok=False, category="malformed", reason="not a note"
+            ok=False, category="duplicate", reason="same as #1"
         ),
     )
     res = client.put(
@@ -244,8 +244,71 @@ def test_update_into_finding_is_validated(monkeypatch):
         json={"type": "finding", "title": "now a finding", "content": "body"},
     )
     assert res.status_code == 422
-    assert res.json()["detail"]["category"] == "malformed"
+    assert res.json()["detail"]["category"] == "duplicate"
 
     body = client.get(f"/api/challenges/{cid}/entries/{entry['id']}").json()
     assert body["type"] == "unconfirmed"
     assert body["title"] == "hunch"
+
+
+def test_duplicate_rejection_names_the_existing_finding(monkeypatch):
+    from app import main
+    from app.validator import Verdict
+
+    cid = make_challenge("t-validator-dup")
+    known = make_entry(cid, "finding", "libc leak via /api/export")
+    monkeypatch.setattr(
+        main,
+        "validate_finding",
+        lambda candidate, existing: Verdict(
+            ok=False,
+            category="duplicate",
+            reason="same leak as existing finding",
+            duplicate_of=known["id"],
+        ),
+    )
+    res = client.post(
+        f"/api/challenges/{cid}/entries",
+        json={
+            "type": "finding",
+            "title": "got the libc base from the export route",
+            "content": "reading __libc_start_main off the returned buffer works",
+            "author": "b",
+        },
+    )
+    assert res.status_code == 422
+    assert res.json()["detail"]["duplicate_of"] == known["id"]
+
+
+def test_duplicate_check_only_sees_findings_of_same_challenge(monkeypatch):
+    from app import main
+    from app.validator import Verdict
+
+    seen = {}
+
+    def capture(candidate, existing):
+        seen["challenge"] = candidate.get("challenge")
+        seen["existing"] = existing
+        return Verdict(ok=True, reason="ok")
+
+    monkeypatch.setattr(main, "validate_finding", capture)
+
+    here = make_challenge("t-validator-scope")
+    other = make_challenge("t-validator-scope-other")
+    same_title = make_entry(here, "finding", "RCE via pickle", author="a")
+    make_entry(here, "unconfirmed", "RCE via pickle", author="b")
+    make_entry(here, "dead_end", "RCE via pickle", author="c")
+    elsewhere = make_entry(other, "finding", "RCE via pickle", author="d")
+
+    res = client.post(
+        f"/api/challenges/{here}/entries",
+        json={"type": "finding", "title": "RCE via pickle", "content": "x", "author": "e"},
+    )
+    assert res.status_code == 201, res.text
+
+    assert seen["challenge"] == "t-validator-scope"
+    ids = [e["id"] for e in seen["existing"]]
+    assert same_title["id"] in ids
+    assert elsewhere["id"] not in ids
+    # unconfirmed / dead_end entries are not part of the comparison set
+    assert len(ids) == 1

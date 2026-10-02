@@ -251,23 +251,26 @@ def delete_challenge(challenge_id: str, db: Session = Depends(get_db)):
 
 def guard_finding(
     db: Session,
-    challenge_id: str,
+    challenge: Challenge,
     candidate: dict,
     exclude_entry_id: int | None = None,
 ):
-    """Validate a candidate finding against the challenge's other entries.
+    """Check a candidate finding against the challenge's other findings.
 
-    Raises 422 with the validator's category and reason if it is rejected.
-    Validation is fail-open, so this only raises on an actual rejection.
+    Raises 422 with the validator's category, reason and the id of the finding
+    it duplicates if the knowledge is already there. Validation is fail-open, so
+    this only raises on an actual rejection.
     """
-    query = db.query(Entry).filter(Entry.challenge_id == challenge_id)
+    query = db.query(Entry).filter(
+        Entry.challenge_id == challenge.id, Entry.type == "finding"
+    )
     if exclude_entry_id is not None:
         query = query.filter(Entry.id != exclude_entry_id)
     existing = [
-        {"type": e.type, "status": e.status, "title": e.title, "content": e.content}
+        {"id": e.id, "type": e.type, "title": e.title, "content": e.content}
         for e in query.order_by(Entry.created_at.desc()).all()
     ]
-    verdict = validate_finding(candidate, existing)
+    verdict = validate_finding({**candidate, "challenge": challenge.name}, existing)
     if not verdict.ok:
         raise HTTPException(
             status_code=422,
@@ -275,6 +278,7 @@ def guard_finding(
                 "message": "finding rejected by validator",
                 "category": verdict.category,
                 "reason": verdict.reason,
+                "duplicate_of": verdict.duplicate_of,
             },
         )
 
@@ -283,12 +287,12 @@ def guard_finding(
 def create_entry(
     challenge_id: str, payload: EntryCreate, db: Session = Depends(get_db)
 ):
-    get_challenge_or_404(db, challenge_id)
+    challenge = get_challenge_or_404(db, challenge_id)
     status = validate_type_status(payload.type, None)
     if payload.type == "finding":
         guard_finding(
             db,
-            challenge_id,
+            challenge,
             {
                 "title": payload.title,
                 "content": payload.content,
@@ -351,7 +355,7 @@ def update_entry(
     if new_type == "finding" and (entry.type != "finding" or text_changed):
         guard_finding(
             db,
-            entry.challenge_id,
+            get_challenge_or_404(db, challenge_id),
             {"title": new_title, "content": new_content, "author": entry.author},
             exclude_entry_id=entry.id,
         )
@@ -386,7 +390,7 @@ def confirm_entry(entry_id: int, db: Session = Depends(get_db)):
     # Validate as finding before promoting
     guard_finding(
         db,
-        entry.challenge_id,
+        get_challenge_or_404(db, entry.challenge_id),
         {"title": entry.title, "content": entry.content, "author": entry.author},
         exclude_entry_id=entry.id,
     )

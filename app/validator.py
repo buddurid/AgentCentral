@@ -1,20 +1,28 @@
-"""AI validation of new findings using a local Ollama model.
+"""Duplicate check for new findings, using a local Ollama model.
 
-Before a `finding` is persisted, it is checked for being a duplicate, stale,
-erroneous or malformed. The judgement is made by a local Ollama model rather
-than by fixed rules, so it can reason about meaning instead of matching strings.
+A new finding is rejected when the team already has that knowledge: the same
+conclusion, observation, primitive or exploit-chain link, even when the wording,
+variable names, endpoint, offset or payload differ. The comparison is semantic
+(a model, not string matching) and is scoped to the findings of the *same*
+challenge.
 
-Configuration (environment variables):
+Only confirmed findings are used as the comparison set. An `unconfirmed` note
+or a `dead_end` is not a duplicate of a finding: the finding still adds
+something, and suppressing it would throw the knowledge away.
 
-    HUB_VALIDATE=0          disable validation entirely (default: enabled)
-    HUB_OLLAMA_URL=...      Ollama base URL (default http://localhost:11434)
-    HUB_OLLAMA_MODEL=...    model name (default llama3.1)
-    HUB_OLLAMA_TIMEOUT=30   request timeout in seconds
+Configuration (environment variables, read at call time):
 
-If Ollama is unreachable, returns an error or gives unusable output, the entry
-is accepted (fail-open) so the hub keeps working. Validation never raises.
+    HUB_VALIDATE=0            disable validation entirely (default: enabled)
+    HUB_OLLAMA_URL=...        Ollama base URL (default http://localhost:11434)
+    HUB_OLLAMA_MODEL=...      model name (default llama3.1)
+    HUB_OLLAMA_TIMEOUT=30     request timeout in seconds
+    HUB_VALIDATE_BATCH=25     existing findings per model call
+    HUB_VALIDATE_MAX_CHARS=2000   max characters kept per entry
 
-NOTE: the exact rules below are a placeholder and will be replaced.
+Existing findings are compared in batches; if any batch reports a duplicate the
+candidate is rejected. If Ollama is unreachable, errors, or answers with unusable
+output the candidate is accepted (fail-open) so the hub keeps working.
+Validation never raises.
 """
 
 import json
@@ -26,32 +34,32 @@ import httpx
 OLLAMA_URL = os.environ.get("HUB_OLLAMA_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("HUB_OLLAMA_MODEL", "llama3.1")
 
-MAX_EXISTING = 30
-MAX_EXISTING_CHARS = 500
+DEFAULT_BATCH = 25
+DEFAULT_MAX_CHARS = 2000
 
-# ---------------------------------------------------------------------------
-# RULES (exact rejection criteria)
-# ---------------------------------------------------------------------------
 SYSTEM_PROMPT = (
-    "You validate findings for a shared CTF research notebook. You are given a "
-    "CANDIDATE finding and the EXISTING entries of the same challenge. "
-    "Only validated entries become confirmed findings. Unconfirmed notes are "
-    "separate and not the focus.\n\n"
-    "Reject the candidate if it matches any category below:\n"
-    '- "duplicate": repeats knowledge already covered by existing entries, even '
-    "if paraphrased or rephrased. Look for the same fact/primitive/observation.\n"
-    '- "stale": outdated, superseded, or no longer true given existing entries '
-    "(e.g. a path previously ruled out or a value that changed).\n"
-    '- "erroneous": factually wrong, self-contradictory, unproven or clearly '
-    "unsupported by evidence presented.\n"
-    '- "malformed": not a usable research note (empty, gibberish, unrelated to '
-    "the challenge, or is process/agent state like prompts, plans, session logs).\n\n"
-    "Accept it otherwise (new, useful, non-duplicative knowledge). Keep reasons "
-    "short and specific.\n\n"
-    "Respond with ONLY a JSON object, no extra text:\n"
+    "You check whether a new CTF finding is already known to the team.\n\n"
+    "You are given a CANDIDATE finding and a list of EXISTING findings from the "
+    "same challenge. Reject the candidate only if it is a duplicate.\n\n"
+    "It IS a duplicate when it conveys the same knowledge as an existing "
+    "finding: the same conclusion, the same observation, the same primitive, or "
+    "the same link in an exploit chain. That holds even when the text is worded "
+    "differently, paraphrased, translated, uses different variable names, "
+    "endpoints, functions, offsets, gadgets or payloads, or is more or less "
+    "verbose. Compare meaning and result, never literal strings or titles.\n\n"
+    "It is NOT a duplicate when it adds anything new, for example:\n"
+    "- a different endpoint, parameter, function or code path\n"
+    "- a different technique, primitive, offset, gadget or workaround\n"
+    "- an extra link in a chain, or a chain where only one link was known\n"
+    "- a broader or narrower claim that extends the existing finding\n"
+    "- a correction, refinement or qualification of the existing finding\n"
+    "- evidence, a payload or output the existing finding did not have\n"
+    "An existing finding may be vague or incomplete; vagueness alone is not a "
+    "duplicate.\n\n"
+    "Reply with ONLY a JSON object and no other text:\n"
     '{"ok": true, "category": "none", "reason": "<brief reason>"}\n'
-    'Set "ok": false and use one of "duplicate","stale","erroneous","malformed" '
-    'for "category"; when ok is true, category may be "none".'
+    'When it is a duplicate reply ok=false, category="duplicate", reason="<same '
+    'knowledge as existing finding #<id>: what it already covers>".'
 )
 
 
@@ -60,6 +68,7 @@ class Verdict:
     ok: bool
     category: str | None = None
     reason: str = ""
+    duplicate_of: int | None = None
 
 
 def _enabled() -> bool:
@@ -71,61 +80,105 @@ def _enabled() -> bool:
     )
 
 
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
 def _timeout() -> float:
     return float(os.environ.get("HUB_OLLAMA_TIMEOUT", "30"))
 
 
-def _existing_text(existing: list[dict]) -> str:
-    if not existing:
-        return "(none)"
+def _clip(text: str | None) -> str:
+    limit = _int_env("HUB_VALIDATE_MAX_CHARS", DEFAULT_MAX_CHARS)
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[:limit] + " [...]"
+
+
+def _findings_only(existing: list[dict]) -> list[dict]:
+    """The comparison set: the challenge's confirmed findings, newest first."""
+    return [e for e in existing if e.get("type") == "finding"]
+
+
+def _batch_text(batch: list[dict]) -> str:
     lines = []
-    for entry in existing[:MAX_EXISTING]:
-        content = (entry.get("content") or "")[:MAX_EXISTING_CHARS]
+    for entry in batch:
         lines.append(
-            f"- [{entry.get('type')}/{entry.get('status')}] "
-            f"{entry.get('title')}: {content}"
+            f"[#{entry.get('id')}] {entry.get('title', '')}\n{_clip(entry.get('content'))}"
         )
-    return "\n".join(lines)
+    return "\n\n".join(lines)
+
+
+def _user_message(candidate: dict, batch: list[dict]) -> str:
+    challenge = (candidate.get("challenge") or "").strip()
+    header = f"CHALLENGE: {challenge}\n\n" if challenge else ""
+    return (
+        f"{header}CANDIDATE FINDING\n"
+        f"title: {candidate.get('title', '')}\n"
+        f"author: {candidate.get('author', '')}\n"
+        f"content: {_clip(candidate.get('content'))}\n\n"
+        "EXISTING FINDINGS FROM THIS CHALLENGE\n"
+        f"{_batch_text(batch)}"
+    )
+
+
+def _ask_model(candidate: dict, batch: list[dict]) -> Verdict:
+    with httpx.Client(timeout=_timeout()) as client:
+        response = client.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={
+                "model": OLLAMA_MODEL,
+                "stream": False,
+                "format": "json",
+                "options": {"temperature": 0},
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": _user_message(candidate, batch)},
+                ],
+            },
+        )
+        response.raise_for_status()
+        data = json.loads(response.json()["message"]["content"])
+    duplicate_of = data.get("duplicate_of")
+    return Verdict(
+        ok=bool(data.get("ok", True)),
+        category=data.get("category") or None,
+        reason=str(data.get("reason", "")),
+        duplicate_of=duplicate_of if isinstance(duplicate_of, int) else None,
+    )
 
 
 def validate_finding(candidate: dict, existing: list[dict]) -> Verdict:
     """Return a Verdict for a candidate `finding`. Never raises."""
     if not _enabled():
-        print("validation disabled")
         return Verdict(ok=True, reason="validation disabled")
-    print("validation enabled")
-    user_message = (
-        "CANDIDATE\n"
-        f"title: {candidate.get('title', '')}\n"
-        f"author: {candidate.get('author', '')}\n"
-        f"content: {candidate.get('content', '')}\n\n"
-        "EXISTING ENTRIES\n"
-        f"{_existing_text(existing)}"
-    )
 
-    try:
-        with httpx.Client(timeout=_timeout()) as client:
-            response = client.post(
-                f"{OLLAMA_URL}/api/chat",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "stream": False,
-                    "format": "json",
-                    "options": {"temperature": 0},
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_message},
-                    ],
-                },
+    findings = _findings_only(existing)
+    if not findings:
+        return Verdict(ok=True, reason="no existing finding to duplicate")
+
+    size = max(1, _int_env("HUB_VALIDATE_BATCH", DEFAULT_BATCH))
+    accepted = 0
+    for start in range(0, len(findings), size):
+        batch = findings[start : start + size]
+        try:
+            verdict = _ask_model(candidate, batch)
+        except Exception as exc:  # noqa: BLE001 - never break the hub
+            return Verdict(
+                ok=True,
+                reason=f"validator unavailable, accepted: {exc}",
             )
-            print(response.json())
-            response.raise_for_status()
-            content = response.json()["message"]["content"]
-        data = json.loads(content)
-        return Verdict(
-            ok=bool(data.get("ok", True)),
-            category=data.get("category") or None,
-            reason=str(data.get("reason", "")),
-        )
-    except Exception as exc:  # noqa: BLE001 - validation must never break the hub
-        return Verdict(ok=True, reason=f"validator unavailable, accepted: {exc}")
+        if not verdict.ok:
+            return Verdict(
+                ok=False,
+                category=verdict.category or "duplicate",
+                reason=verdict.reason,
+                duplicate_of=verdict.duplicate_of,
+            )
+        accepted += len(batch)
+
+    return Verdict(
+        ok=True, reason=f"new knowledge, not covered by {accepted} existing finding(s)"
+    )
