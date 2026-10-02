@@ -163,13 +163,26 @@ finding. A local Ollama model is asked one question: **does the team already
 have this?**
 
 The check is semantic, not textual. A candidate is a duplicate when it conveys
-the same conclusion, observation, primitive or exploit-chain link as an existing
-finding, even when the text is worded differently, paraphrased, translated, or
-uses different variable names, endpoints, functions, offsets, gadgets or
-payloads. Titles and literal string overlap are never the criterion. It is *not*
-a duplicate when the candidate adds a new endpoint or code path, a new
-technique, an extra link in a chain, a broader or narrower claim, a correction
-or refinement, or evidence the existing finding lacked.
+the same conclusion, observation or leak as an existing finding, even when the
+text is worded differently, paraphrased, or uses different names or payloads.
+Titles and literal string overlap are never the criterion. Completing a lead
+counts as the same result: a finding that says "look for X" and a candidate
+that reports "found X" are duplicates when X is the same thing — the candidate
+adds nothing the team did not already know to look for. It is *not* a duplicate
+when the candidate adds a new endpoint or code path, a new technique, an extra
+link in a chain, a correction, or evidence the existing finding lacked.
+
+One conversation per challenge:
+
+- The backend keeps a **session per challenge**: a single ongoing Ollama
+  conversation listing every finding, newest last. Each validation appends one
+  turn — the new findings plus the question, or just the question when nothing
+  changed — so the model keeps the general context instead of starting over.
+- Sessions live in memory and are rebuilt after a restart. A session is only
+  valid while it matches the database: new findings are told to the model as a
+  delta, but if anything was edited or deleted the session is reset with the
+  full list. If even the full list does not fit the history budget, that call
+  falls back to one fresh chat per batch, storing nothing.
 
 Scope and comparison set:
 
@@ -180,18 +193,19 @@ Scope and comparison set:
   an unverified note said something similar would throw the knowledge away.
 - Near-identical text (similarity ≥ 0.9) is rejected outright with no model
   call, so plain re-posts are caught even when the model is unusable.
-- The rest is judged in batches; a batch only ever rejects through the re-check
-  below.
+- The rest is judged in one turn against everything the session knows; a
+  rejection only ever happens through the re-check below. (Batching survives
+  only in the oversized stateless fallback.)
 
 How small-model confusion is handled, since those are the models actually used:
 
-- **The verdict never comes from a boolean or from prose.** The judge answers
-  `{"duplicate_of": <id or null>, "reason": "..."}` and only a valid id counts
-  as a duplicate. A small model will otherwise answer `"ok": true` while its
-  reason says the candidate is the same knowledge as an existing finding.
-- **Contradictions go to a yes/no re-check, not to a guess.** If the answer
-  points at a real finding but gives no usable id (contradictory flags, a vague
-  duplicate claim), that one pair is re-asked with a short question —
+- **The judge must do its homework first.** It answers `{"closest": <id or
+  null>, "duplicate_of": <id or null>, "reason": "..."}`: first name the
+  existing finding about the same thing, then decide. Only a valid id in
+  `duplicate_of` counts as a duplicate.
+- **Hedging and contradictions go to a yes/no re-check, not to a guess.** A
+  valid `closest` with null `duplicate_of`, or a reason naming a `[#id]`
+  without a usable id, sends that one pair to a short question —
   `{"same": true/false, "reason": "..."}` — and its answer decides. Nothing is
   ever attributed to a finding the model did not name.
 - **References must be written `[#7]`.** Only bracketed references count, so a
@@ -225,8 +239,10 @@ has no findings yet, no model call is made at all.
 | `HUB_OLLAMA_URL`         | `http://localhost:11434` | Ollama base URL                          |
 | `HUB_OLLAMA_MODEL`       | `llama3.1`              | model to use                             |
 | `HUB_OLLAMA_TIMEOUT`     | `30`                    | request timeout in seconds               |
+| `HUB_OLLAMA_CTX`         | `8192`                  | model context window requested           |
 | `HUB_VALIDATE_BATCH`     | `25`                    | existing findings per model call         |
 | `HUB_VALIDATE_CONFIRM`   | `1`                     | second check before rejecting            |
+| `HUB_VALIDATE_HISTORY`   | `16000`                 | max stored conversation chars per challenge |
 | `HUB_VALIDATE_MAX_CHARS` | `2000`                  | max characters kept per entry            |
 | `HUB_VALIDATE_DEBUG`     | `0`                     | `1` prints every model answer            |
 

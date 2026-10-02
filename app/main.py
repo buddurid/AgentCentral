@@ -270,7 +270,10 @@ def guard_finding(
         {"id": e.id, "type": e.type, "title": e.title, "content": e.content}
         for e in query.order_by(Entry.created_at.desc()).all()
     ]
-    verdict = validate_finding({**candidate, "challenge": challenge.name}, existing)
+    verdict = validate_finding(
+        {**candidate, "challenge": challenge.name, "challenge_id": challenge.id},
+        existing,
+    )
     if not verdict.ok:
         raise HTTPException(
             status_code=422,
