@@ -51,7 +51,7 @@ Configuration (environment variables, read per call):
     HUB_VALIDATE=0            disable validation entirely (default: enabled)
     HUB_OLLAMA_URL=...        Ollama base URL (default http://localhost:11434)
     HUB_OLLAMA_MODEL=...      model name (default llama3.1)
-    HUB_OLLAMA_TIMEOUT=30     request timeout in seconds
+    HUB_OLLAMA_TIMEOUT=120    request timeout in seconds (load + eval + generate)
     HUB_OLLAMA_CTX=8192       model context window requested
     HUB_VALIDATE_BATCH=25     findings judged per turn (stateless fallback)
     HUB_VALIDATE_CONFIRM=1    re-check a duplicate before dropping it
@@ -82,6 +82,9 @@ DEFAULT_BATCH = 25
 DEFAULT_MAX_CHARS = 2000
 DEFAULT_HISTORY_CHARS = 16000
 DEFAULT_CTX = 8192
+# A request covers model load + prompt eval + generation. On CPU-only hosts a
+# single judge call can take a minute, and the default must cover that.
+DEFAULT_TIMEOUT = 120
 MAX_SESSIONS = 200
 NEAR_DUP_RATIO = 0.9
 NEAR_DUP_MIN_CHARS = 60
@@ -238,7 +241,7 @@ def _ollama_model() -> str:
 
 
 def _timeout() -> float:
-    return float(os.environ.get("HUB_OLLAMA_TIMEOUT", "30"))
+    return float(os.environ.get("HUB_OLLAMA_TIMEOUT", str(DEFAULT_TIMEOUT)))
 
 
 def _clip(text: str | None) -> str:
@@ -464,8 +467,16 @@ def _chat(messages: list[dict], schema: dict) -> dict:
                 print(f"[validator] mode {index} rejected: {response.text[:200]}")
             continue
         response.raise_for_status()
+        data = response.json()
+        if _debug():
+            print(
+                f"[validator] mode {index} {data.get('total_duration', 0) / 1e9:.1f}s "
+                f"(load {data.get('load_duration', 0) / 1e9:.1f}s, "
+                f"eval {data.get('prompt_eval_count')} prompt + "
+                f"{data.get('eval_count')} gen)"
+            )
         _chat_state.update({"url": url, "model": model, "index": index})
-        return response.json()
+        return data
     raise ValueError("ollama rejected every request mode")
 
 
@@ -718,7 +729,16 @@ def validate_finding(candidate: dict, existing: list[dict]) -> Verdict:
         )
     except Exception as exc:  # noqa: BLE001 - never break the hub
         reason = f"validator unavailable, accepted: {exc}"
-        _warn(f"{reason} (challenge {key!r}, candidate {candidate.get('title', '')!r})")
+        hint = ""
+        if "timed out" in str(exc).lower():
+            hint = (
+                f" (request exceeded HUB_OLLAMA_TIMEOUT={_timeout():g}s - raise it, "
+                "or the model is too slow for this host)"
+            )
+        _warn(
+            f"{reason}{hint} (challenge {key!r}, "
+            f"candidate {candidate.get('title', '')!r})"
+        )
         return Verdict(ok=True, reason=reason)
 
 

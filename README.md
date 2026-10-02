@@ -239,7 +239,7 @@ has no findings yet, no model call is made at all.
 | `HUB_VALIDATE`           | `1`                     | `0`/`false`/`no`/`off` disables validation |
 | `HUB_OLLAMA_URL`         | `http://localhost:11434` | Ollama base URL                          |
 | `HUB_OLLAMA_MODEL`       | `llama3.1`              | model to use                             |
-| `HUB_OLLAMA_TIMEOUT`     | `30`                    | request timeout in seconds               |
+| `HUB_OLLAMA_TIMEOUT`     | `120`                   | request timeout in seconds (load + eval + generate) |
 | `HUB_OLLAMA_CTX`         | `8192`                  | model context window requested           |
 | `HUB_VALIDATE_BATCH`     | `25`                    | existing findings per model call         |
 | `HUB_VALIDATE_CONFIRM`   | `1`                     | second check before rejecting            |
