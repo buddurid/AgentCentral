@@ -71,6 +71,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import threading
 from dataclasses import dataclass, field
 from typing import Any
@@ -213,6 +214,12 @@ def _flag(name: str, default: str = "1") -> bool:
 
 def _debug() -> bool:
     return _flag("HUB_VALIDATE_DEBUG", "0")
+
+
+def _warn(message: str) -> None:
+    """Always printed. Fail-open must never be silent: an accepted candidate
+    that should have been rejected is a leak nobody can see otherwise."""
+    print(f"[validator] ACCEPTED ANYWAY: {message}", file=sys.stderr, flush=True)
 
 
 def _int_env(name: str, default: int) -> int:
@@ -654,8 +661,11 @@ def validate_finding(candidate: dict, existing: list[dict]) -> Verdict:
                 _record_turn(session, key, question, answer, current, set())
                 base = list(session.messages)
             if same is not True:
-                if _debug():
-                    print(f"[validator] re-check disagreed: {reason}")
+                _warn(
+                    f"judge pointed at #{entry_id} ({reason!r}) but the re-check "
+                    f"said {'different' if same is False else 'nothing'} - "
+                    f"candidate {candidate.get('title', '')!r} accepted"
+                )
                 return None
         return Verdict(
             ok=False,
@@ -707,7 +717,9 @@ def validate_finding(candidate: dict, existing: list[dict]) -> Verdict:
             reason=f"new knowledge, not covered by {len(findings)} existing finding(s)",
         )
     except Exception as exc:  # noqa: BLE001 - never break the hub
-        return Verdict(ok=True, reason=f"validator unavailable, accepted: {exc}")
+        reason = f"validator unavailable, accepted: {exc}"
+        _warn(f"{reason} (challenge {key!r}, candidate {candidate.get('title', '')!r})")
+        return Verdict(ok=True, reason=reason)
 
 
 def _validate_stateless(
