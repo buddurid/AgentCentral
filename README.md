@@ -8,20 +8,11 @@ The server stores **what the team learned**, not what the agents did. There are
 no sessions, prompts, tasks, checkpoints, handoffs or orchestration — just a
 small, boring REST API and a place to put research findings.
 
-  Agent A ─┐
-  Agent B ─┼─ MCP (stdio) ──>  mcp_server ──HTTP┐
-  Agent C ─┘                                    │
-  browser ───────────── UI + Swagger ───────────┤
-                                                │   mcp_server is launched on each agent machine
-                                                │
-                                                ┌────────────────────────────────────────┐
-                                                │ AgentCentral   FastAPI + SQLite        │
-                                                │ every finding → Ollama duplicate check │
-                                                └────────────────────────────────────────┘
-                                                │
-                                                ┌──────────────────┐
-                                                │ Ollama qwen3:4b  │
-                                                └──────────────────┘
+```
+Agent A ──┐
+Agent B ──┼──> AgentCentral  (SQLite + files on disk)
+Agent C ──┘
+```
 
 Agents never talk to each other. They read from and write to the hub.
 
@@ -48,7 +39,6 @@ Agents never talk to each other. They read from and write to the hub.
 - **Minimal dark web UI** and auto-generated Swagger docs at `/docs`.
 - **MCP server** exposing 10 tools; a thin wrapper over the REST API.
 - **Persistence**: SQLite + `data/` survive restarts.
-- **Semantic duplicate gate** on every finding, backed by a local Ollama model.
 - Single process, no external services required. No auth. Docker optional —
   `docker compose up -d` runs the hub together with Ollama.
 
@@ -57,44 +47,15 @@ Agents never talk to each other. They read from and write to the hub.
 ## Architecture
 
 ```
-  Agent A ─┐
-  Agent B ─┼─ MCP (stdio) ──>  mcp_server ──HTTP──┐
-  Agent C ─┘                                       │
-  browser ───────────── UI + Swagger ─────────────┤
-                                                   │  mcp_server is launched on each agent machine
-                                                   │
-┌─── docker network: hubnet  bridge ───────────────▼───────────────────────────────────────────────┐
-│      no host port is published for ollama; only the hub reaches it                               │
-│   ┌─ hub   image built from ./Dockerfile   ·   :8000 published ──────────────────────────────┐   │
-│   │ FastAPI  app/main.py  ·  REST · /docs · / (web UI)                                       │   │
-│   │       │                                                                                  │   │
-│   │       │ guard_finding()  on create / confirm / PUT→finding                               │   │
-│   │       ▼                                                                                  │   │
-│   │       app/validator.py                                                                   │   │
-│   │       1  near-identical text (difflib ≥ 0.9) → 422, no call                              │   │
-│   │       2  judge turn → {closest, duplicate_of, reason}                                    │   │
-│   │       3  hedge / [#id] / token tripwire → yes-no re-check                                │   │
-│   │       4  any error → fail-open + ACCEPTED ANYWAY on stderr                               │   │
-│   │       │                                                                                  │   │
-│   │       │ sessions[challenge_id]   delta · reset · budget                                  │   │
-│   │       ▼                                                                                  │   │
-│   │       SQLAlchemy → SQLite data/ctf.db + files/   (vol: hub_data)                         │   │
-│   └──────────────────────────────────────────────────────────────────────────────────────────┘   │
-│           │  POST /api/chat    HUB_OLLAMA_URL · _MODEL · _TIMEOUT                                │
-│           ▼                                                                                      │
-│   ┌─ ollama    :11434    internal only, never published ─────────────────────────────────────┐   │
-│   │ qwen3:4b (4-bit) · OLLAMA_KEEP_ALIVE=24h · num_ctx 8192                                  │   │
-│   │ volume: ollama_models  →  /root/.ollama                                                  │   │
-│   └──────────────────────────────────────────────────────────────────────────────────────────┘   │
-│           │  ollama pull $OLLAMA_MODEL   (after healthcheck)                                     │
-│           ▼                                                                                      │
-│   ┌─ model    one-shot init, exits 0 once weights land ──────────────────────────────────────┐   │
-│   └──────────────────────────────────────────────────────────────────────────────────────────┘   │
-│           hub  depends_on: model (service_completed_successfully)                                │
-│                                                                                                  │
-└──────────────────────────────────────────────────▲───────────────────────────────────────────────┘
-                                                   │
-                                                   └── hub also serves HTTP from the host on :8000
+┌────────────┐   stdio (MCP)   ┌───────────────────┐   HTTP    ┌──────────────────────┐
+│  Agent /   │ ──────────────> │  mcp_server       │ ────────> │  FastAPI  (app.main)  │
+│  harness   │                 │  (per machine)    │           │  REST API + Web UI    │
+└────────────┘                 └───────────────────┘           └───────────┬──────────┘
+                                                                           │ SQLAlchemy
+                                                              ┌────────────▼──────────┐
+                                                              │ SQLite  data/ctf.db   │
+                                                              │ files  data/challenges│
+                                                              └───────────────────────┘
 ```
 
 The server (`app/`) and the MCP client (`mcp_server/`) are separate packages;
@@ -112,7 +73,6 @@ the MCP code only talks to the server over HTTP.
 | `mcp_server/__main__.py`   | MCP entry point (`python -m mcp_server`)                               |
 | `static/index.html`        | Single-file vanilla-JS UI served at `/`                               |
 | `tests/test_api.py`        | REST tests using FastAPI's `TestClient`                               |
-| `tests/test_validator.py`  | Parsing / pipeline tests; the model is stubbed, no Ollama needed      |
 | `Dockerfile`               | hub image: deps, non-root user, `/data`, healthcheck                  |
 | `docker-compose.yml`       | `hub` + `ollama` + one-shot `model` on the `hubnet` bridge            |
 
@@ -185,17 +145,17 @@ docker compose up -d
 
 Three containers on a private bridge network (`hubnet`):
 
-| service  | image                 | role                                                    |
-| -------- | --------------------- | ------------------------------------------------------- |
-| `hub`    | built from `Dockerfile` | FastAPI + SQLite, publishes `:8000`                    |
-| `ollama` | `ollama/ollama`       | model runtime on `ollama:11434`, **no host port**       |
-| `model`  | `ollama/ollama`       | one-shot: `ollama pull $OLLAMA_MODEL`, then exits 0     |
+| service  | image                   | role                                                  |
+| -------- | ----------------------- | ----------------------------------------------------- |
+| `hub`    | built from `Dockerfile` | FastAPI + SQLite, publishes `:8000`                   |
+| `ollama` | `ollama/ollama`         | model runtime on `ollama:11434`, **no host port**     |
+| `model`  | `ollama/ollama`         | one-shot: `ollama pull $OLLAMA_MODEL`, then exits 0   |
 
-Startup order is enforced: `ollama` healthcheck → `model` pull → `hub`. The first
-finding therefore never lands on a cold or missing model.
+Startup order is enforced by healthcheck + dependency: `ollama` → `model` →
+`hub`, so the first finding never lands on a cold or missing model.
 
-- Weights persist in the `ollama_models` volume, data in `hub_data`.
-- Override anything with a `.env` file next to `docker-compose.yml`:
+- Weights persist in the `ollama_models` volume, hub data in `hub_data`.
+- Override settings with a `.env` next to `docker-compose.yml`:
   `HUB_PORT`, `OLLAMA_MODEL`, `HUB_OLLAMA_TIMEOUT`, `HUB_VALIDATE`, …
 - GPU: uncomment the `deploy.resources` block in `docker-compose.yml`.
 - Logs: `docker compose logs -f hub`.
@@ -231,46 +191,6 @@ A `finding` is checked before it is stored — on create, on
 `POST /api/entries/{id}/confirm`, and on an update that turns an entry into a
 finding. A local Ollama model is asked one question: **does the team already
 have this?**
-
-The whole decision path:
-
-```
-POST/PUT entry  (type == "finding")  →  guard_finding()
-    │
-    ├─ HUB_VALIDATE off ──────────────────────────────────────> accept
-    ├─ no existing findings for this challenge ────────────────> accept   (0 model calls)
-    │
-    ├─ near-identical text (difflib ≥ 0.9) to any finding?
-    │     yes → 422 duplicate_of #N                      0 model calls
-    │     no  ↓
-    │
-    ├─ _classify(session.seen, db fingerprint) →
-    │     stale   edited/deleted finding → reset session, resend full list
-    │     over    len(msg) > HUB_VALIDATE_HISTORY → stateless, 1 chat per batch of 25
-    │     added   send only new entries + the question (delta)
-    │     same    send the question only
-    │
-    ▼
-    JUDGE   1 turn · structured output · think=False · temperature 0
-            {"closest": id|null, "duplicate_of": id|null, "reason": "..."}
-            │
-            ├─ duplicate_of = valid id ────────────────────┐
-            ├─ closest = id, duplicate_of = null (hedge) ──┤
-            ├─ reason names [#id] but no usable id ────────┤  unclear
-            ├─ null/null, reason names a shared link token ┤  (tripwire:
-            │   token has a digit / . _ / -   #8080 never counts)  → re-check
-            │                                              │
-            └─ clean, no id named ──> accept               │
-                                                           ▼
-    CONFIRM   yes/no on that ONE pair   {"same": bool, "reason": "..."}
-            │
-            ├─ same = true  ──────────> 422 duplicate_of #N
-            ├─ same = false ──> accept + ACCEPTED ANYWAY warning
-            └─ no answer    ──> accept + ACCEPTED ANYWAY warning
-
-    ANY exception  (timeout · connection refused · non-JSON · all modes 400)
-            └─> accept, stderr:  [validator] ACCEPTED ANYWAY: ...
-```
 
 The check is semantic, not textual. A candidate is a duplicate when it conveys
 the same conclusion, observation or leak as an existing finding, even when the
@@ -354,28 +274,28 @@ check prints one line to stderr:
 
 Seeing that line in `docker compose logs -f hub` means the model is down,
 misconfigured or too slow — not that the validator judged the entry clean. The
-three usual causes are a wrong `HUB_OLLAMA_URL` / `HUB_OLLAMA_MODEL`, a cold
-model, or a `HUB_OLLAMA_TIMEOUT` shorter than load + prompt eval + generation.
+usual causes are a wrong `HUB_OLLAMA_URL` / `HUB_OLLAMA_MODEL`, a cold model, or
+a `HUB_OLLAMA_TIMEOUT` shorter than load + prompt eval + generation.
 
 | Variable                 | Default                 | Meaning                                  |
 | ------------------------ | ----------------------- | ---------------------------------------- |
 | `HUB_VALIDATE`           | `1`                     | `0`/`false`/`no`/`off` disables validation |
 | `HUB_OLLAMA_URL`         | `http://localhost:11434` | Ollama base URL (`http://ollama:11434` in Docker) |
 | `HUB_OLLAMA_MODEL`       | `llama3.1`              | model to use (`qwen3:4b` in Docker; ≥4B recommended) |
-| `HUB_OLLAMA_TIMEOUT`     | `120`                   | request timeout in seconds — covers load + prompt eval + generation; raise it on CPU-only hosts |
+| `HUB_OLLAMA_TIMEOUT`     | `120`                   | request timeout in seconds — load + prompt eval + generation; raise on CPU-only hosts |
 | `HUB_OLLAMA_CTX`         | `8192`                  | model context window requested           |
 | `HUB_VALIDATE_BATCH`     | `25`                    | existing findings per model call (stateless fallback only) |
 | `HUB_VALIDATE_CONFIRM`   | `1`                     | second check before rejecting            |
 | `HUB_VALIDATE_HISTORY`   | `16000`                 | max stored conversation chars per challenge |
 | `HUB_VALIDATE_MAX_CHARS` | `2000`                  | max characters kept per entry            |
-| `HUB_VALIDATE_DEBUG`     | `0`                     | `1` prints every model answer **and** per-request timing (`mode 0 4.5s (load 0.0s, eval 542 prompt + 37 gen)`) |
+| `HUB_VALIDATE_DEBUG`     | `0`                     | `1` prints every model answer and per-request timing (`mode 0 4.5s (load 0.0s, eval 542 prompt + 37 gen)`) |
 
-Model sizing: judge + confirm is two calls per validation. Locally
-(60% GPU offload) that is ~5s + ~3s; a CPU-only VPS runs 3–10× slower, which is
-why the timeout default is 120s and compose sets 180s. Sub-1B models
-(e.g. `qwen3:0.6b`) understand the duplication but cannot reliably hold the JSON
-schema, so their answers route through the hedge/tripwire path and cost extra
-re-check calls — 4B is the practical floor.
+Judge + confirm is two calls per validation: roughly 5s + 3s on a GPU-offloaded
+local model, 3–10× slower on a CPU-only VPS — which is why the timeout default
+is 120s and compose sets 180s. Sub-1B models (e.g. `qwen3:0.6b`) understand the
+duplication but cannot hold the JSON schema reliably, so their answers route
+through the hedge/tripwire path and cost extra re-check calls; 4B is the
+practical floor.
 
 ```bash
 curl -X POST http://localhost:8000/api/challenges/web/entries \
@@ -666,26 +586,23 @@ can copy the same text into their own `AGENTS.md` / `CLAUDE.md`.
 
 ```
 .
-├── app/                    # FastAPI server
+├── app/                  # FastAPI server
 │   ├── __init__.py
-│   ├── __main__.py         # python -m app
-│   ├── db.py               # engine, models, init_db / migration
-│   ├── main.py             # FastAPI app (REST + UI route) + guard_finding
-│   └── validator.py        # Ollama duplicate check: judge + yes/no re-check
-├── mcp_server/             # MCP client / tools
+│   ├── __main__.py       # python -m app
+│   ├── db.py             # engine, models, init_db / migration
+│   └── main.py           # FastAPI app (REST + UI route)
+├── mcp_server/           # MCP client / tools
 │   ├── __init__.py
-│   ├── __main__.py         # python -m mcp_server
-│   └── server.py           # MCP tools -> REST API
-├── static/index.html       # web UI
-├── tests/
-│   ├── test_api.py         # REST tests (TestClient)
-│   └── test_validator.py   # pipeline tests, model stubbed
-├── examples/               # example harness configs
+│   ├── __main__.py       # python -m mcp_server
+│   └── server.py         # MCP tools -> REST API
+├── static/index.html     # web UI
+├── tests/test_api.py
+├── examples/             # example harness configs
 │   ├── opencode.json
 │   └── .mcp.json
-├── Dockerfile              # hub image
+├── Dockerfile            # hub image
 ├── .dockerignore
-├── docker-compose.yml      # hub + ollama + one-shot model pull
+├── docker-compose.yml    # hub + ollama + one-shot model pull
 ├── requirements.txt
 ├── pytest.ini
 └── README.md
